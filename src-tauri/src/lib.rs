@@ -415,6 +415,17 @@ pub fn run() {
             }
             tray.build(app)?;
 
+            // 关窗 = 隐藏到托盘常驻（托盘"退出"菜单才是真退出）
+            if let Some(w) = app.get_webview_window("main") {
+                let handle = w.clone();
+                w.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = handle.hide();
+                    }
+                });
+            }
+
             // ①②③ + ④：三个采集线程 + 核心消费线程
             spawn_transcript_watcher(tx.clone());
             spawn_hook_poller(tx.clone());
