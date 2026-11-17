@@ -404,6 +404,8 @@ pub fn run() {
             // ⑤ 托盘：默认图标 + 初始菜单（等待 0 · 运行 0 / 打开看板 / 退出）
             let mut tray = tauri::tray::TrayIconBuilder::with_id(TRAY_ID)
                 .tooltip("agentboard")
+                // tray-icon 默认左键弹菜单（抢焦点）——关掉：左键=纯唤回窗口，右键=菜单
+                .show_menu_on_left_click(false)
                 .menu(&build_tray_menu(app.handle(), 0, 0)?)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => show_main(app),

@@ -52,12 +52,12 @@ impl Machine {
                 title,
                 ts,
             } => {
-                // Discovered 一律先置 Running（last_activity=事件 ts）。这是有意设计：
-                // - 首扫发现的历史会话：ts 是真实历史时间 → 首个 Tick 立即推断 Done
-                //   （done_inferred），通知被 lib.rs 的 APP_START 闸静默，不会闪烁成"运行中"；
-                // - 活会话（ZCode presence 存活 + turn 进行中）：随后的实时 Activity ts=now
-                //   把 last_activity 顶到 now → 阈值内 Tick 不误推断，看板保持"运行中"
-                //   （链路见 collectors/zcode_db.rs）。
+                // Discovered 一律先置 Running（last_activity=事件 ts）。两种走向，如实描述：
+                // - 首扫发现的历史会话（ts=真实历史时间）：首个 Tick 即静默推断 Done
+                //   （done_inferred，通知被 lib.rs 的 APP_START 闸拦下）；turn 结束后的
+                //   实时 Waiting（ts=now）恢复等待态并通知。
+                // - 持续实时活动的会话：Activity ts=now 把 last_activity 顶到 now，
+                //   阈值内 Tick 不误推断（链路见 collectors/zcode_db.rs）。
                 let entry = self
                     .sessions
                     .entry(session_id.clone())
