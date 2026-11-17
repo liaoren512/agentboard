@@ -57,22 +57,25 @@ impl ZcodePoller {
             });
         });
 
-        // 每会话最新 turn（按 started_at 降序取第一条；大表用 LIMIT 保护）
-        let _ = self.con.prepare(
-            "SELECT session_id, status, error_type, completed_at FROM turn_usage ORDER BY started_at DESC LIMIT 500"
-        ).map(|mut st| {
-            let _ = st.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, Option<i64>>(3)?))
-            }).map(|it| {
-                for (sid, status, error_type, completed_at) in it.flatten() {
+        // 对存活会话（数量小）逐个取最新 turn——按需取数，正确性与全局 turn 数据量解耦
+        if let Ok(mut stmt) = self.con.prepare(
+            "SELECT status, error_type, completed_at FROM turn_usage WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1"
+        ) {
+            let live_ids: Vec<String> = rows.iter().filter(|(_, r)| r.presence).map(|(id, _)| id.clone()).collect();
+            for sid in live_ids {
+                let _ = stmt.query_row([&sid], |r| {
+                    Ok(TurnRow {
+                        status: r.get(0)?,
+                        error_type: r.get(1)?,
+                        completed_at: r.get(2)?,
+                    })
+                }).map(|t| {
                     if let Some(row) = rows.get_mut(&sid) {
-                        if row.latest_turn.is_none() {
-                            row.latest_turn = Some(TurnRow { status, error_type, completed_at });
-                        }
+                        row.latest_turn = Some(t);
                     }
-                }
-            });
-        });
+                });
+            }
+        }
 
         for (id, row) in rows {
             let z = if row.presence {
@@ -192,5 +195,21 @@ mod tests {
         let mut p2 = ZcodePoller::with_connection(con2).unwrap();
         let ev2 = p2.poll(100);
         assert!(ev2.iter().any(|e| matches!(e, UnifiedEvent::Closed { session_id, .. } if session_id=="z2")), "无 presence 即关闭");
+    }
+
+    #[test]
+    fn stale_running_turn_survives_global_turn_volume() {
+        let con = fixture_db();
+        insert_session(&con, "z1", None);
+        con.execute("INSERT INTO session_runtime_presence VALUES ('z1','o',1)", []).unwrap();
+        // z1 的运行中 turn：started_at 很旧、未完成
+        con.execute("INSERT INTO turn_usage (session_id,status,started_at) VALUES ('z1','completed',1)", []).unwrap();
+        // 另一会话插入 600 条更新的 turn：旧的全局 LIMIT 500 窗口会把 z1 挤出 → 误判 Idle
+        for i in 2..=601 {
+            con.execute("INSERT INTO turn_usage (session_id,status,started_at) VALUES ('z2','completed',?1)", [i]).unwrap();
+        }
+        let mut p = ZcodePoller::with_connection(con).unwrap();
+        let ev = p.poll(100);
+        assert!(ev.iter().any(|e| matches!(e, UnifiedEvent::Activity { session_id, .. } if session_id=="z1")), "运行中 turn 不被其他会话的 turn 量挤出窗口");
     }
 }
