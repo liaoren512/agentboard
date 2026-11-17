@@ -271,6 +271,20 @@ fn show_main(app: &AppHandle) {
     }
 }
 
+/// 横幅主体点击判定。action_id 语义来自插件 desktop.rs：notify-rust 的
+/// NotificationResponse::Default（toast 主体点击）→ "tap"（desktop.rs:724）。
+fn is_notification_tap(action_id: &str) -> bool {
+    action_id == "tap"
+}
+
+/// 通知横幅点击处理：toast 主体点击（action_id = "tap"）唤起看板窗口并聚焦，
+/// 与托盘左键/菜单"打开看板"同一行为（show_main）。其他 action（如未来加的按钮）不处理。
+fn handle_notification_action(app: &AppHandle, action_id: &str) {
+    if is_notification_tap(action_id) {
+        show_main(app);
+    }
+}
+
 fn update_tray(app: &AppHandle, snaps: &[SessionSnapshot]) {
     let waiting = snaps
         .iter()
@@ -414,6 +428,16 @@ pub fn run() {
             machine: machine.clone(),
         })
         .setup(move |app| {
+            // 通知横幅点击：toast 主体点击（tap）→ 唤起看板窗口。
+            // 插件 desktop.rs：handler 注册进全局 shared，须尽早注册；
+            // "Notifications shown before the first handler existed report nothing"。
+            let notif_app = app.handle().clone();
+            app.notification()
+                .on_action(move |action| {
+                    handle_notification_action(&notif_app, action.action_id());
+                })
+                .expect("register notification click handler");
+
             // ⑤ 托盘：默认图标 + 初始菜单（等待 0 · 运行 0 / 打开看板 / 退出）
             let mut tray = tauri::tray::TrayIconBuilder::with_id(TRAY_ID)
                 .tooltip("agentboard")
@@ -683,5 +707,24 @@ mod tests {
             "实时活动（晚于启动时刻）放行通知"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 横幅点击分派契约：用插件自身类型定义反序列化，验证插件 desktop 上报的
+    /// "横幅主体点击"（notify-rust Default → "tap"）恰好命中 is_notification_tap 的判定；
+    /// 其他 action（dismiss/未知）不触发唤起。（tauri mock runtime 在本机测试进程
+    /// 启动失败 0xc0000139，窗口级断言以构建后人工点验为准。）
+    #[test]
+    fn notification_banner_click_maps_to_tap_dispatch() {
+        let click: tauri_plugin_notification::ActionPerformed =
+            serde_json::from_str(r#"{"actionId":"tap"}"#).unwrap();
+        assert!(
+            is_notification_tap(click.action_id()),
+            "横幅主体点击 → 唤起"
+        );
+
+        let dismiss: tauri_plugin_notification::ActionPerformed =
+            serde_json::from_str(r#"{"actionId":"dismiss"}"#).unwrap();
+        assert!(!is_notification_tap(dismiss.action_id()));
+        assert!(!is_notification_tap(""), "未知 action 不唤起");
     }
 }
