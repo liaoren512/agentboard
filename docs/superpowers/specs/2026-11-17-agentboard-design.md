@@ -2,11 +2,11 @@
 
 日期：2026-11-17
 状态：待用户终审
-参考项目：[Pitwall](https://pitwall.oasislab.dev/)（macOS，闭源 App + 开源采集器 [JasonHZS/pitwall-collector](https://github.com/JasonHZS/pitwall-collector)）
+参考项目：一款 macOS 同类菜单栏看板工具（闭源 App + 开源采集器）
 
 ## 1. 背景与目标
 
-并行使用多个 coding agent 时，会话状态分散在各个终端/窗口里：等待审批的会话没人管、悄悄失败的会话没人发现。Pitwall 在 macOS 上用"菜单栏看板"解决这个问题。本项目的目标是在 **Windows** 上做一个同类工具：
+并行使用多个 coding agent 时，会话状态分散在各个终端/窗口里：等待审批的会话没人管、悄悄失败的会话没人发现。同类工具已在 macOS 上用"菜单栏看板"解决这个问题。本项目的目标是在 **Windows** 上做一个同类工具：
 
 - 把 **Claude Code** 和 **ZCode** 的会话聚合到一块实时看板
 - 托盘常驻，一眼看到「几个在等我、几个在跑」
@@ -24,7 +24,7 @@
 
 ## 2. 方案选型（已定）
 
-**方案 A：混合采集**——每个 agent 挑最合适的通道（这正是 Pitwall 的实际做法：Kimi Code、DeepSeek Harness 也是纯读日志零 hook）：
+**方案 A：混合采集**——每个 agent 挑最合适的通道（这正是参考项目的实际做法：Kimi Code、DeepSeek Harness 也是纯读日志零 hook）：
 
 | 候选 | 结论 |
 |---|---|
@@ -98,7 +98,7 @@ hook 的 stdin 输入含 `session_id`、`transcript_path`、`cwd`、`message` �
 
 ## 5. 状态判定规则
 
-五状态：`运行中 / 等待(权限|提问|空闲|其他) / 失败 / 完成`。判定来源按可靠性排序，**推不出来的不硬标**（Pitwall 原则：信号不可靠就不声称）。
+五状态：`运行中 / 等待(权限|提问|空闲|其他) / 失败 / 完成`。判定来源按可靠性排序，**推不出来的不硬标**（原则：信号不可靠就不声称）。
 
 | 状态 | Claude Code | ZCode |
 |---|---|---|
@@ -138,7 +138,7 @@ hook 的 stdin 输入含 `session_id`、`transcript_path`、`cwd`、`message` �
 
 1. **"等待中"带类型字段**（permission/question/idle/other）——审批功能直接消费，不重构状态机
 2. **hook 安装器按"可注册多个 hook"实现**——后期加 `PermissionRequest` hook 只是配置多一项
-3. 审批实现路径（照 Pitwall 验证过的模式）：`PermissionRequest` hook 触发 → 请求文件挂 `~/.agentboard/approvals/` 队列 → 应用/通知横幅点批准或拒绝 → hook 写回应答退出；60 秒未应答则退出不置可否，终端原生弹窗照常；先到先答
+3. 审批实现路径（照同类工具验证过的模式）：`PermissionRequest` hook 触发 → 请求文件挂 `~/.agentboard/approvals/` 队列 → 应用/通知横幅点批准或拒绝 → hook 写回应答退出；60 秒未应答则退出不置可否，终端原生弹窗照常；先到先答
 4. 转录格式真变了 → 生命周期升级为 hooks（安装器现成），升级路径而非重写
 
 ## 9. 测试策略
@@ -157,3 +157,12 @@ hook 的 stdin 输入含 `session_id`、`transcript_path`、`cwd`、`message` �
 - 2026-11-17 选定方案 A（混合采集），放弃 B（零安装，等待状态推不出）、C/A'（全 hook，ZCode 侧注定读文件，统一性买不到）
 - 2026-11-17 v1 范围定为只读监控；审批交互为第一优先级后续功能
 - 2026-11-17 应用形态定为 Tauri 托盘应用（放弃 .NET/WinUI、本地 Web 看板）
+
+## v0.1.0 实现偏差注记
+
+以下为本版实现与设计文档的已知偏差，如实记录：
+
+1. **ZCode db 读不了时会话列表静默冻结**：§7 的 rollout JSONL 兜底与「源离线」标注未实现，计划 v0.1.1
+2. **历史 1000 条仅存档**：history.sqlite 正常写入并保留最近 1000 条，但重启应用后不回填到看板
+3. **托盘叠加数字未做**：§3.3 设计的"托盘图标叠加两个数字"未实现，计数以托盘菜单文本呈现（「等待 N · 运行 N」）
+4. **无日志文件**：§3.4 数据布局中的 `logs/agentboard.log` 未实现

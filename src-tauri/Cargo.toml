@@ -1,0 +1,46 @@
+[package]
+name = "agentboard"
+version = "0.1.0"
+description = "Windows 托盘看板：聚合 Claude Code / ZCode 会话状态"
+authors = ["liaoren512"]
+edition = "2024"
+# 两个二进制（主程序 + agentboard-hook）时 tauri build 需要知道主二进制
+default-run = "agentboard"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "agentboard"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-clipboard-manager = "2"
+notify-debouncer-full = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "7"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[[bin]]
+name = "agentboard"
+path = "src/main.rs"
+
+[[bin]]
+name = "agentboard-hook"
+path = "src/hook_main.rs"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+# 不设 panic = "abort"：spawn_guarded 的 catch_unwind 守卫依赖 unwind 才能在 release 生效
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
