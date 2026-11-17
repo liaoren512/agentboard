@@ -25,6 +25,11 @@ impl Machine {
         }
     }
 
+    /// 每次注入 Tick 前由 lib.rs 按 config 覆盖（设置页改动实时生效）
+    pub fn set_done_after_ms(&mut self, ms: u64) {
+        self.done_after_ms = ms;
+    }
+
     pub fn process(&mut self, event: &UnifiedEvent) -> Vec<Update> {
         let mut out = Vec::new();
         match event {
@@ -373,5 +378,17 @@ mod tests {
             ups.iter().all(|u| u.snapshot.status != SessionStatus::Done),
             "实时活动后阈值内不误推断 Done"
         );
+    }
+
+    /// 回归（v0.1.1 接线）：set_done_after_ms 注入后，Tick 推断立即用新阈值
+    #[test]
+    fn set_done_after_ms_takes_effect_on_tick() {
+        let mut m = Machine::new(60_000);
+        m.process(&disc(AgentKind::ClaudeCode, "s1", TS));
+        // 阈值缩到 1s：TS+1000 处即推断 Done（旧阈值 60s 内不会推断）
+        m.set_done_after_ms(1_000);
+        let ups = m.process(&UnifiedEvent::Tick { now: TS + 1_000 });
+        assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0].snapshot.status, SessionStatus::Done);
     }
 }
