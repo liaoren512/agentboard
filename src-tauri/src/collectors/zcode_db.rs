@@ -138,27 +138,45 @@ impl ZcodePoller {
 
         let fresh_ms = self.running_fresh_ms;
         for (id, row) in rows {
-            // Running = presence && (进行中 turn || time_updated 新鲜)。实测 ZCode 的
-            // turn_usage 只在回合结束写行（completed/error/cancelled），生成期间库里没有
-            // completed_at IS NULL 的行 → 仅凭 turn 臂活会话永远显示"空闲"、"运行中→空闲"
-            // 边沿与"在等你处理"通知永不出现；而生成中 session.time_updated 每 2s 刷新，
-            // 新鲜度是当前 ZCode 唯一可靠的运行信号（turn 臂保留，兼容未来 ZCode 行为）。
+            // presence 分支的运行中判定（v0.1.1 复审精化）。实测 ZCode 的 turn_usage 只在
+            // 回合结束写行（completed/error/cancelled），生成期间库里没有 completed_at IS NULL
+            // 的行 → 仅凭 turn 臂活会话永远显示"空闲"、"运行中→空闲"边沿与"在等你处理"通知
+            // 永不出现；而生成中 session.time_updated 每 2s 刷新，新鲜度是当前 ZCode 唯一
+            // 可靠的运行信号。单看新鲜度有歧义（"刚结束"也新鲜），用 latest turn 的
+            // completed_at 与 time_updated 先后（1s 容差）区分：
+            // - time_updated <= completed_at+1s ⇒ 回合结束就是最后一次事件 → 终态立即落定，
+            //   不被新鲜窗口延迟（error → Failed 即时；completed/cancelled → 刚结束语义上
+            //   就是空闲，IdleWaiting 边沿与通知立即出现）
+            // - time_updated > completed_at+1s ⇒ 结束后又有活动（用户已开始新轮次）→ 新鲜
+            //   窗口内判 Running
             let fresh = row.time_updated.saturating_add(fresh_ms) > now;
             let z = if row.presence {
                 match &row.latest_turn {
-                    Some(t) if t.completed_at.is_none() || fresh => ZStatus::Running,
-                    // 无 turn 行 + time_updated 新鲜 → 生成中的实际库内形态
+                    // ① 有进行中 turn → Running（兼容未来 ZCode 行为）
+                    Some(t) if t.completed_at.is_none() => ZStatus::Running,
+                    // ② 最新完结 turn + 回合结束即最后事件 → 终态立即（不看新鲜度）
+                    Some(t) => match t.completed_at {
+                        Some(done_at)
+                            if (row.time_updated as i64) <= done_at.saturating_add(1000) =>
+                        {
+                            if t.status == "error"
+                                && t.error_type.as_deref() != Some("turn_cancelled")
+                            {
+                                ZStatus::Failed
+                            } else {
+                                ZStatus::IdleWaiting
+                            }
+                        }
+                        // ③ 回合结束后又有活动（用户开始新轮次）→ 走新鲜度判定
+                        _ if fresh => ZStatus::Running,
+                        _ => ZStatus::IdleWaiting,
+                    },
+                    // ③ 无 turn 行 + time_updated 新鲜 → 生成中的实际库内形态
                     _ if fresh => ZStatus::Running,
-                    Some(t)
-                        if t.status == "error"
-                            && t.error_type.as_deref() != Some("turn_cancelled") =>
-                    {
-                        ZStatus::Failed
-                    }
-                    // presence 存活 + time_updated 陈旧 + turn 全完成 → 等待·空闲（进"需处理"组）。
-                    // 教训：曾在这里按 last_outcome 判 Closed，而 ZCode 每轮结束都写
-                    // last_outcome='completed' → 活会话几乎永远被误标"完成"，
-                    // 等待/运行/失败永不出现。只有 presence 消失才算 Closed。
+                    // ④ 其余：time_updated 陈旧 + 最新 turn 完结/无 turn 行 → 等待·空闲
+                    // （进"需处理"组）。教训：曾按 last_outcome 判 Closed，而 ZCode 每轮结束
+                    // 都写 last_outcome='completed' → 活会话几乎永远被误标"完成"。只有
+                    // presence 消失才算 Closed。
                     _ => ZStatus::IdleWaiting,
                 }
             } else {
@@ -313,8 +331,9 @@ mod tests {
         .unwrap();
         con.execute("INSERT INTO turn_usage (session_id,status,error_type,started_at,completed_at) VALUES ('z1','error','unknown_error',20,30)", []).unwrap();
         let mut p = ZcodePoller::with_connection(con).unwrap();
-        // poll 时刻取 time_updated=50 的 fresh 窗口之外：error 非 cancelled → TurnFailed
-        let ev = p.poll(200_000);
+        // 回合结束（completed_at=30）即最后事件（time_updated=50 <= 30+1s 容差）→
+        // 终态立即落定，error 非 cancelled → TurnFailed，不受新鲜窗口延迟
+        let ev = p.poll(100);
         assert!(
             ev.iter()
                 .any(|e| matches!(e, UnifiedEvent::TurnFailed { .. }))
@@ -329,7 +348,7 @@ mod tests {
         .unwrap();
         con2.execute("INSERT INTO turn_usage (session_id,status,error_type,started_at,completed_at) VALUES ('z2','error','turn_cancelled',20,30)", []).unwrap();
         let mut p2 = ZcodePoller::with_connection(con2).unwrap();
-        let ev2 = p2.poll(200_000);
+        let ev2 = p2.poll(100);
         assert!(
             !ev2.iter()
                 .any(|e| matches!(e, UnifiedEvent::TurnFailed { .. })),
@@ -368,8 +387,9 @@ mod tests {
         )
         .unwrap();
         let mut p = ZcodePoller::with_connection(con).unwrap();
-        // poll 时刻取 time_updated=50 的 fresh 窗口之外：陈旧 + turn 全完成 → 等待·空闲
-        let ev = p.poll(200_000);
+        // 回合结束（completed_at=20）即最后事件（time_updated=50 <= 20+1s 容差）→
+        // 刚结束语义上就是空闲：Waiting 立即出现，不被新鲜窗口延迟
+        let ev = p.poll(100);
         assert!(
             ev.iter().any(|e| matches!(
                 e,
@@ -496,88 +516,188 @@ mod tests {
         );
     }
 
-    /// 回归（v0.1.1：ZCode 运行中判定改用 time_updated 新鲜度）：ZCode 的 turn_usage
-    /// 行只在回合结束写，生成期间库里没有 completed_at IS NULL 的行，但 session.time_updated
-    /// 每 2s 刷新——presence + time_updated 新鲜必须判 Running，否则活会话全程显示
-    /// "空闲"、"运行中→空闲"边沿与"在等你处理"通知永不出现。
+    /// 回归（v0.1.1 复审精化①）：error 回合的 completed_at==time_updated（回合结束就是
+    /// 最后一次事件）→ TurnFailed 立即落定，即使 time_updated 仍新鲜——新鲜度只是
+    /// "刚结束"的残温，失败通知不得被 fresh 窗口延迟 2 分钟。
     #[test]
-    fn fresh_time_updated_means_running_even_when_turn_finished() {
-        // ① time_updated 距 poll 时刻 30s（fresh=120s）+ turn 已完结 → Activity（Running）
+    fn error_turn_ended_as_last_event_fails_immediately_even_when_fresh() {
         let con = fixture_db();
-        insert_session(&con, "z1", Some("completed"), 30);
+        insert_session(&con, "z1", None, 71_000);
         con.execute(
             "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
             [],
         )
         .unwrap();
         con.execute(
-            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z1','completed',1,25)",
+            "INSERT INTO turn_usage (session_id,status,error_type,started_at,completed_at) VALUES ('z1','error','unknown_error',60000,71000)",
             [],
         )
         .unwrap();
         let mut p = ZcodePoller::with_connection(con).unwrap();
-        p.set_running_fresh_ms(120_000);
-        let ev = p.poll(100_000); // 30 + 120_000 > 100_000 → 新鲜
+        let ev = p.poll(100_000); // 71_000+120_000 > 100_000 → 新鲜，但仍须立即 Failed
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, UnifiedEvent::TurnFailed { .. })),
+            "error 回合结束即最后事件 → TurnFailed 即时，不被新鲜窗口延迟"
+        );
+    }
+
+    /// 回归（v0.1.1 复审精化②）：error 回合结束后 time_updated > completed_at+1s
+    /// （模拟用户已开始新轮次）且 time_updated 新鲜 → Running——失败不能卡住新轮次的
+    /// 运行态直到新鲜度过期。
+    #[test]
+    fn error_turn_then_new_activity_fresh_means_running() {
+        let con = fixture_db();
+        insert_session(&con, "z1", None, 80_000);
+        con.execute(
+            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO turn_usage (session_id,status,error_type,started_at,completed_at) VALUES ('z1','error','unknown_error',60000,71000)",
+            [],
+        )
+        .unwrap();
+        let mut p = ZcodePoller::with_connection(con).unwrap();
+        let ev = p.poll(100_000); // 80_000 > 71_000+1s（有新活动）；80_000+120_000 > 100_000（新鲜）
         assert!(
             ev.iter().any(|e| matches!(
                 e,
                 UnifiedEvent::Activity { session_id, .. } if session_id=="z1"
             )),
-            "presence + time_updated 新鲜 + turn 已完结 → Activity（Running）"
+            "error 回合后用户开始新轮次（有新活动）+ 新鲜 → Running"
         );
+    }
 
-        // ② time_updated 距 poll 时刻 10 分钟 + turn 完结 → Waiting(Idle)
+    /// 回归（v0.1.1 复审精化③）：completed 回合的 completed_at==time_updated（刚结束、
+    /// 无后续活动）→ IdleWaiting 立即出现，即使 time_updated 仍新鲜——刚结束语义上
+    /// 就是空闲，"运行中→空闲"边沿与"在等你处理"通知不被新鲜窗口延迟 2 分钟。
+    #[test]
+    fn completed_turn_ended_as_last_event_is_idle_immediately_even_when_fresh() {
         let con = fixture_db();
-        insert_session(&con, "z2", Some("completed"), 0);
+        insert_session(&con, "z1", Some("completed"), 71_000);
         con.execute(
-            "INSERT INTO session_runtime_presence VALUES ('z2','o',1)",
+            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
             [],
         )
         .unwrap();
         con.execute(
-            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z2','completed',1,500)",
+            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z1','completed',60000,71000)",
             [],
         )
         .unwrap();
         let mut p = ZcodePoller::with_connection(con).unwrap();
-        p.set_running_fresh_ms(120_000);
-        let ev = p.poll(600_000); // 0 + 120_000 < 600_000 → 陈旧
+        let ev = p.poll(100_000); // 71_000+120_000 > 100_000 → 新鲜，但仍须立即 Idle
         assert!(
             ev.iter().any(|e| matches!(
                 e,
-                UnifiedEvent::Waiting { session_id, kind: WaitingKind::Idle, .. } if session_id=="z2"
+                UnifiedEvent::Waiting { session_id, kind: WaitingKind::Idle, .. } if session_id=="z1"
+            )),
+            "completed 回合结束即最后事件 → 等待·空闲即时，不被新鲜窗口延迟"
+        );
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, UnifiedEvent::Activity { .. })),
+            "刚结束的 completed 不得误显运行中"
+        );
+    }
+
+    /// 回归（v0.1.1：ZCode 运行中判定改用 time_updated 新鲜度）：ZCode 的 turn_usage
+    /// 行只在回合结束写，生成期间库里没有 completed_at IS NULL 的行，但 session.time_updated
+    /// 每 2s 刷新——回合结束后又有新活动（用户开始新轮次）+ time_updated 新鲜必须判
+    /// Running，否则活会话全程显示"空闲"。
+    #[test]
+    fn completed_turn_then_new_activity_fresh_means_running() {
+        let con = fixture_db();
+        insert_session(&con, "z1", Some("completed"), 50_000);
+        con.execute(
+            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z1','completed',1,25000)",
+            [],
+        )
+        .unwrap();
+        let mut p = ZcodePoller::with_connection(con).unwrap();
+        let ev = p.poll(100_000); // 50_000 > 25_000+1s（有新活动）；50_000+120_000 > 100_000（新鲜）
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                UnifiedEvent::Activity { session_id, .. } if session_id=="z1"
+            )),
+            "completed 回合后用户开始新轮次（有新活动）+ 新鲜 → Running"
+        );
+    }
+
+    /// 回归（v0.1.1）：time_updated 陈旧（距 poll 时刻 10 分钟）+ 完结 turn 后无新活动
+    /// → 等待·空闲（presence 存活，绝不 Closed）。
+    #[test]
+    fn stale_completed_turn_is_idle_waiting() {
+        let con = fixture_db();
+        insert_session(&con, "z1", Some("completed"), 100_000);
+        con.execute(
+            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z1','completed',1,500)",
+            [],
+        )
+        .unwrap();
+        let mut p = ZcodePoller::with_connection(con).unwrap();
+        let ev = p.poll(600_000); // 100_000+120_000 < 600_000 → 陈旧
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                UnifiedEvent::Waiting { session_id, kind: WaitingKind::Idle, .. } if session_id=="z1"
             )),
             "time_updated 陈旧 + turn 完结 → 等待·空闲"
         );
+        assert!(
+            !ev.iter().any(|e| matches!(e, UnifiedEvent::Closed { .. })),
+            "presence 存活绝不产 Closed"
+        );
+    }
 
-        // ③ time_updated 新鲜 + 无 turn 行 → Activity（生成期间的库内实际形态）
+    /// 回归（v0.1.1）：无 turn 行 + time_updated 新鲜 → Running（生成期间的库内实际
+    /// 形态：ZCode 生成中不写 turn 行，time_updated 每 2s 刷新）。
+    #[test]
+    fn no_turn_row_fresh_means_running() {
         let con = fixture_db();
-        insert_session(&con, "z3", None, 99_000);
+        insert_session(&con, "z1", None, 99_000);
         con.execute(
-            "INSERT INTO session_runtime_presence VALUES ('z3','o',1)",
+            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
             [],
         )
         .unwrap();
         let mut p = ZcodePoller::with_connection(con).unwrap();
-        let ev = p.poll(100_000); // 默认 fresh=120s：99_000 + 120_000 > 100_000 → 新鲜
+        let ev = p.poll(100_000); // 默认 fresh=120s：99_000+120_000 > 100_000 → 新鲜
         assert!(
             ev.iter().any(|e| matches!(
                 e,
-                UnifiedEvent::Activity { session_id, .. } if session_id=="z3"
+                UnifiedEvent::Activity { session_id, .. } if session_id=="z1"
             )),
             "无 turn 行 + time_updated 新鲜 → Running（当前 ZCode 生成中的唯一信号）"
         );
+    }
 
-        // ④ 进行中 turn + time_updated 陈旧 → Activity（OR 的 turn 臂，兼容未来 ZCode 行为）
+    /// 回归（v0.1.1）：进行中 turn（completed_at IS NULL）+ time_updated 陈旧 → Running
+    ///（OR 的 turn 臂，兼容未来 ZCode 开始写进行中行的行为）。
+    #[test]
+    fn active_turn_means_running_even_when_stale() {
         let con = fixture_db();
-        insert_session(&con, "z4", None, 0);
+        insert_session(&con, "z1", None, 0);
         con.execute(
-            "INSERT INTO session_runtime_presence VALUES ('z4','o',1)",
+            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
             [],
         )
         .unwrap();
         con.execute(
-            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z4','completed',1,NULL)",
+            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z1','completed',1,NULL)",
             [],
         )
         .unwrap();
@@ -586,31 +706,45 @@ mod tests {
         assert!(
             ev.iter().any(|e| matches!(
                 e,
-                UnifiedEvent::Activity { session_id, .. } if session_id=="z4"
+                UnifiedEvent::Activity { session_id, .. } if session_id=="z1"
             )),
-            "进行中 turn（completed_at IS NULL）即使 time_updated 陈旧也判 Running"
+            "进行中 turn 即使 time_updated 陈旧也判 Running"
         );
+    }
 
-        // ⑤ set_running_fresh_ms 生效：fresh=1s 时 30s 前的时间戳已陈旧 → Waiting
+    /// 回归（v0.1.1）：set_running_fresh_ms 实时生效——同库同 poll 时刻，fresh=1s 判
+    /// 空闲，注入 fresh=120s 后同一时刻边沿翻转为 Running。
+    #[test]
+    fn set_running_fresh_ms_takes_effect() {
         let con = fixture_db();
-        insert_session(&con, "z5", Some("completed"), 70_000);
+        insert_session(&con, "z1", Some("completed"), 60_000);
         con.execute(
-            "INSERT INTO session_runtime_presence VALUES ('z5','o',1)",
+            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
             [],
         )
         .unwrap();
         con.execute(
-            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z5','completed',1,71_000)",
+            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z1','completed',1,50000)",
             [],
         )
         .unwrap();
         let mut p = ZcodePoller::with_connection(con).unwrap();
         p.set_running_fresh_ms(1_000);
-        let ev = p.poll(100_000); // 70_000 + 1_000 < 100_000 → 陈旧
+        let ev = p.poll(100_000); // 60_000 > 50_000+1s（臂②不中）；60_000+1_000 < 100_000 → 陈旧
         assert!(
             ev.iter().any(|e| matches!(
                 e,
-                UnifiedEvent::Waiting { session_id, kind: WaitingKind::Idle, .. } if session_id=="z5"
+                UnifiedEvent::Waiting { session_id, kind: WaitingKind::Idle, .. } if session_id=="z1"
+            )),
+            "fresh=1s 时 40s 前的时间戳已陈旧 → 等待·空闲"
+        );
+        // 同一 poll 时刻放大窗口 → 边沿翻转为 Running（阈值注入实时生效）
+        p.set_running_fresh_ms(120_000);
+        let ev = p.poll(100_000); // 60_000+120_000 > 100_000 → 新鲜
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                UnifiedEvent::Activity { session_id, .. } if session_id=="z1"
             )),
             "running_fresh_ms 注入后阈值实时生效"
         );

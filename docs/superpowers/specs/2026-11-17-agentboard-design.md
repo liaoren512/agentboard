@@ -169,4 +169,4 @@ hook 的 stdin 输入含 `session_id`、`transcript_path`、`cwd`、`message` �
 
 ## v0.1.1 实现偏差注记
 
-1. **设置页两阈值曾未接线（本版修复）**：running_fresh_ms / done_after_ms 在 v0.1.0 仅存 config.json 不生效；v0.1.1 起 ZCode 运行中判定改用 time_updated 新鲜度（running_fresh_ms 每次 poll 前注入 ZcodePoller）、完成推断阈值 done_after_ms 每次注入 Tick 前注入 Machine，设置页保存后实时生效
+1. **设置页两阈值曾未接线（本版修复）**：running_fresh_ms / done_after_ms 在 v0.1.0 仅存 config.json 不生效；v0.1.1 起 ZCode 运行中判定改用 time_updated 新鲜度（running_fresh_ms 每次 poll 前注入 ZcodePoller）、完成推断阈值 done_after_ms 每次注入 Tick 前注入 Machine，设置页保存后实时生效。判定精化（复审）：用 latest turn 的 completed_at 与 time_updated 先后（1s 容差）区分"刚结束"与"又开始了"——回合结束即最后事件时终态立即落定（error→Failed / completed→IdleWaiting，不被新鲜窗口延迟），结束后又有新活动且新鲜才判 Running
