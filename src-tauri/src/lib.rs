@@ -498,4 +498,60 @@ mod tests {
             app_start
         ));
     }
+
+    /// 验收修复回归（ZCode db 启动通知风暴）：首扫把无 presence 的历史会话判 Closed，
+    /// 事件 ts = 会话 time_updated（旧）→ machine 产出 should_notify=true 的 Done，
+    /// 但 last_activity 停在历史时间 → APP_START 闸拦截，重启不再弹「ZCode 任务完成」。
+    #[test]
+    fn zcode_historical_closed_first_scan_is_silent() {
+        let now = 10_000_000_000_000u64;
+        let old_updated = now - 3_600_000; // 历史会话最后更新于 1 小时前
+        let con = rusqlite::Connection::open_in_memory().unwrap();
+        con.execute_batch(
+            r#"CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT,
+                time_created INTEGER, time_updated INTEGER, last_outcome TEXT,
+                time_deleted INTEGER, time_archived INTEGER);
+            CREATE TABLE session_runtime_presence (session_id TEXT, owner_id TEXT, process_id INTEGER);
+            CREATE TABLE turn_usage (id INTEGER PRIMARY KEY, session_id TEXT, status TEXT,
+                error_type TEXT, started_at INTEGER, completed_at INTEGER);"#,
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session (id,title,directory,time_created,time_updated,last_outcome) VALUES ('z1','t',?1,?2,?2,NULL)",
+            rusqlite::params![r"C:\repo\z", old_updated],
+        )
+        .unwrap();
+
+        // 启动首扫：历史会话 → Discovered + Closed（ts 均为 time_updated）
+        let mut p = crate::collectors::zcode_db::ZcodePoller::with_connection(con).unwrap();
+        let events = p.poll(now);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UnifiedEvent::Closed { ts, .. } if *ts == old_updated as u64)),
+            "首扫 Closed 带会话历史时间"
+        );
+
+        let mut m = Machine::new(DONE_AFTER);
+        let mut ups = Vec::new();
+        for e in &events {
+            ups.extend(m.process(e));
+        }
+        let done = ups
+            .iter()
+            .find(|u| u.snapshot.status == SessionStatus::Done)
+            .expect("Closed 应把历史会话判为 Done");
+        assert!(
+            ups.iter().any(|u| u.should_notify),
+            "machine 不知道启动时刻，会请求通知"
+        );
+        assert_eq!(
+            done.snapshot.last_activity, old_updated as u64,
+            "last_activity 停在历史时间，不被轮询时刻顶起"
+        );
+        assert!(
+            !notification_allowed(done.snapshot.last_activity, now),
+            "APP_START 闸拦截历史回填，不发通知"
+        );
+    }
 }

@@ -8,6 +8,9 @@ struct Row {
     title: String,
     directory: String,
     last_outcome: Option<String>,
+    /// 会话真实历史时间（epoch ms）：历史推导的状态迁移（Discovered/Closed）带它当 ts，
+    /// 让启动回填被 lib.rs 的 APP_START 闸拦住，否则首扫历史会话按 ts=now 弹通知风暴。
+    time_updated: u64,
     presence: bool,
     latest_turn: Option<TurnRow>,
 }
@@ -58,7 +61,7 @@ impl ZcodePoller {
         let mut rows: HashMap<String, Row> = HashMap::new();
 
         let Ok(mut stmt) = self.con.prepare(
-            "SELECT id, title, directory, last_outcome FROM session WHERE time_deleted IS NULL AND time_archived IS NULL"
+            "SELECT id, title, directory, last_outcome, time_updated FROM session WHERE time_deleted IS NULL AND time_archived IS NULL"
         ) else { return out };
         let _ = stmt
             .query_map([], |r| {
@@ -67,16 +70,19 @@ impl ZcodePoller {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
+                    // 真实库 NOT NULL；防御 NULL/负值退 0（必被启动闸拦截，安全侧）
+                    r.get::<_, Option<i64>>(4)?.unwrap_or_default().max(0) as u64,
                 ))
             })
             .map(|it| {
-                for (id, title, directory, last_outcome) in it.flatten() {
+                for (id, title, directory, last_outcome, time_updated) in it.flatten() {
                     rows.insert(
                         id,
                         Row {
                             title,
                             directory,
                             last_outcome,
+                            time_updated,
                             presence: false,
                             latest_turn: None,
                         },
@@ -144,14 +150,17 @@ impl ZcodePoller {
             let agent = AgentKind::ZCode;
             if !self.known.contains(&id) {
                 self.known.insert(id.clone());
+                // 首扫发现的历史会话：ts 带会话 time_updated（历史推导，不触发通知语义）
                 out.push(UnifiedEvent::Discovered {
                     agent,
                     session_id: id.clone(),
                     cwd: row.directory.clone(),
                     title: Some(row.title.clone()),
-                    ts: now,
+                    ts: row.time_updated,
                 });
             }
+            // Activity/Waiting/TurnFailed 是 presence 存活会话的实时信号，保持 ts=now 照常通知；
+            // Closed（历史推导）用会话 time_updated，见上方 Row 注释。
             let prev = self.prev.get(&id);
             match (&z, prev) {
                 (ZStatus::Running, Some(ZStatus::Running)) => {}
@@ -174,10 +183,12 @@ impl ZcodePoller {
                     ts: now,
                 }),
                 (ZStatus::Closed, Some(ZStatus::Closed)) => {}
+                // 历史推导的关闭（presence 消失 / last_outcome 完成）：ts 带会话
+                // time_updated（真实历史时间）→ 启动首扫被 APP_START 闸静默，不再通知风暴
                 (ZStatus::Closed, _) => out.push(UnifiedEvent::Closed {
                     agent,
                     session_id: id.clone(),
-                    ts: now,
+                    ts: row.time_updated,
                 }),
             }
             self.prev.insert(id, z);
@@ -204,15 +215,15 @@ mod tests {
         con
     }
 
-    fn insert_session(con: &Connection, id: &str, last_outcome: Option<&str>) {
-        con.execute("INSERT INTO session (id,title,directory,time_created,time_updated,last_outcome) VALUES (?1,?2,?3,1,1,?4)",
-            rusqlite::params![id, "标题", r"C:\repo\z", last_outcome]).unwrap();
+    fn insert_session(con: &Connection, id: &str, last_outcome: Option<&str>, time_updated: i64) {
+        con.execute("INSERT INTO session (id,title,directory,time_created,time_updated,last_outcome) VALUES (?1,?2,?3,1,?4,?5)",
+            rusqlite::params![id, "标题", r"C:\repo\z", time_updated, last_outcome]).unwrap();
     }
 
     #[test]
     fn discover_then_idle_when_presence_without_active_turn() {
         let con = fixture_db();
-        insert_session(&con, "z1", None);
+        insert_session(&con, "z1", None, 50);
         con.execute(
             "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
             [],
@@ -236,7 +247,7 @@ mod tests {
     #[test]
     fn active_turn_is_running_activity() {
         let con = fixture_db();
-        insert_session(&con, "z1", None);
+        insert_session(&con, "z1", None, 50);
         con.execute(
             "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
             [],
@@ -265,7 +276,7 @@ mod tests {
     #[test]
     fn error_turn_failed_but_cancelled_not_failed() {
         let con = fixture_db();
-        insert_session(&con, "z1", None);
+        insert_session(&con, "z1", None, 50);
         con.execute(
             "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
             [],
@@ -280,7 +291,7 @@ mod tests {
         );
 
         let con2 = fixture_db();
-        insert_session(&con2, "z2", None);
+        insert_session(&con2, "z2", None, 50);
         con2.execute(
             "INSERT INTO session_runtime_presence VALUES ('z2','o',1)",
             [],
@@ -299,7 +310,7 @@ mod tests {
     #[test]
     fn presence_gone_or_last_outcome_closes() {
         let con = fixture_db();
-        insert_session(&con, "z1", Some("completed"));
+        insert_session(&con, "z1", Some("completed"), 50);
         con.execute(
             "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
             [],
@@ -309,24 +320,52 @@ mod tests {
         let ev = p.poll(100);
         assert!(
             ev.iter()
-                .any(|e| matches!(e, UnifiedEvent::Closed { session_id, .. } if session_id=="z1"))
+                .any(|e| matches!(e, UnifiedEvent::Closed { session_id, ts, .. } if session_id=="z1" && *ts == 50))
         );
 
         let con2 = fixture_db();
-        insert_session(&con2, "z2", None);
+        insert_session(&con2, "z2", None, 50);
         let mut p2 = ZcodePoller::with_connection(con2).unwrap();
         let ev2 = p2.poll(100);
         assert!(
             ev2.iter()
-                .any(|e| matches!(e, UnifiedEvent::Closed { session_id, .. } if session_id=="z2")),
-            "无 presence 即关闭"
+                .any(|e| matches!(e, UnifiedEvent::Closed { session_id, ts, .. } if session_id=="z2" && *ts == 50)),
+            "无 presence 即关闭，ts 是会话历史时间而非轮询时刻"
+        );
+    }
+
+    /// 回归（验收缺陷：启动通知风暴）：无 presence 的历史会话首扫判 Closed 时，
+    /// ts 必须是会话的 time_updated（真实历史时间），不得等于轮询时刻 now——
+    /// 否则 last_activity=now 绕过 lib.rs 的 APP_START 回填闸，重启即弹一轮"任务完成"。
+    #[test]
+    fn historical_session_without_presence_closes_with_historical_ts() {
+        let con = fixture_db();
+        let old_updated = 1_000i64; // 明显早于轮询时刻
+        insert_session(&con, "z-hist", None, old_updated);
+        let mut p = ZcodePoller::with_connection(con).unwrap();
+        let ev = p.poll(999_000_000);
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                UnifiedEvent::Discovered { session_id, ts, .. }
+                    if session_id == "z-hist" && *ts == old_updated as u64
+            )),
+            "Discovered 同样携带 time_updated（保持一致性）"
+        );
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                UnifiedEvent::Closed { session_id, ts, .. }
+                    if session_id == "z-hist" && *ts == old_updated as u64
+            )),
+            "Closed 携带 time_updated 而非 now"
         );
     }
 
     #[test]
     fn stale_running_turn_survives_global_turn_volume() {
         let con = fixture_db();
-        insert_session(&con, "z1", None);
+        insert_session(&con, "z1", None, 50);
         con.execute(
             "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
             [],
