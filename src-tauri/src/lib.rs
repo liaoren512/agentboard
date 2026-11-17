@@ -1,5 +1,13 @@
 pub mod collectors;
 pub mod core;
+pub mod events_file;
+
+pub fn agentboard_dir() -> std::path::PathBuf {
+    dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join(".agentboard")
+}
+pub fn events_file_now_ms() -> u64 { crate::core::types::now_ms() }
+pub fn events_file_handle_input(input: &str, ts: u64) -> Option<String> { events_file::handle_input(input, ts) }
+pub fn events_file_append_event(line: &str, dir: &std::path::Path) -> std::io::Result<()> { events_file::append_event(line, dir) }
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
