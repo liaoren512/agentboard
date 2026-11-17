@@ -1,6 +1,7 @@
 pub mod collectors;
 pub mod core;
 pub mod events_file;
+pub mod installer;
 
 pub fn agentboard_dir() -> std::path::PathBuf {
     dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join(".agentboard")
