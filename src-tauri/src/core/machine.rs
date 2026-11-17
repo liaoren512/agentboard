@@ -52,6 +52,12 @@ impl Machine {
                 title,
                 ts,
             } => {
+                // Discovered 一律先置 Running（last_activity=事件 ts）。这是有意设计：
+                // - 首扫发现的历史会话：ts 是真实历史时间 → 首个 Tick 立即推断 Done
+                //   （done_inferred），通知被 lib.rs 的 APP_START 闸静默，不会闪烁成"运行中"；
+                // - 活会话（ZCode presence 存活 + turn 进行中）：随后的实时 Activity ts=now
+                //   把 last_activity 顶到 now → 阈值内 Tick 不误推断，看板保持"运行中"
+                //   （链路见 collectors/zcode_db.rs）。
                 let entry = self
                     .sessions
                     .entry(session_id.clone())
@@ -345,5 +351,27 @@ mod tests {
             now: TS + 2 * DONE_AFTER,
         });
         assert!(ups.is_empty(), "等待中的会话不做完成推断");
+    }
+
+    /// 回归（验收缺陷：活会话误判 Done）：首扫 Discovered 带历史 ts → Running，
+    /// 随后活会话的实时 Activity（ts=now）把 last_activity 顶起 → 阈值内的 Tick
+    /// 绝不推断 Done（否则正在跑的会话会被标成"完成"）。
+    #[test]
+    fn historical_discover_then_fresh_activity_stays_running() {
+        let mut m = Machine::new(DONE_AFTER);
+        m.process(&disc(AgentKind::ZCode, "z1", TS - 3_600_000)); // 首扫：历史时间
+        let ups = m.process(&UnifiedEvent::Activity {
+            agent: AgentKind::ZCode,
+            session_id: "z1".into(),
+            ts: TS, // 实时活动顶起 last_activity
+        });
+        assert_eq!(ups[0].snapshot.status, SessionStatus::Running);
+        let ups = m.process(&UnifiedEvent::Tick {
+            now: TS + DONE_AFTER - 1,
+        });
+        assert!(
+            ups.iter().all(|u| u.snapshot.status != SessionStatus::Done),
+            "实时活动后阈值内不误推断 Done"
+        );
     }
 }

@@ -409,6 +409,17 @@ pub fn run() {
                     "open" => show_main(app),
                     "quit" => app.exit(0),
                     _ => {}
+                })
+                // 托盘左键单击（松开）= 唤回主窗口，与"打开看板"菜单同一行为（show_main）
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        show_main(tray.app_handle());
+                    }
                 });
             if let Some(icon) = app.default_window_icon() {
                 tray = tray.icon(icon.clone());
@@ -564,5 +575,98 @@ mod tests {
             !notification_allowed(done.snapshot.last_activity, now),
             "APP_START 闸拦截历史回填，不发通知"
         );
+    }
+
+    /// 验收修复回归（首扫回填语义）：首扫把 presence 存活 + turn 全完成的会话判
+    /// 等待·空闲，Waiting 事件 ts = 会话 time_updated（历史时间）→ machine 请求通知
+    /// 但被 APP_START 闸拦截；首扫结束后 turn 变为进行中，Activity ts=now（实时）
+    /// → 通知放行。既不风暴也不漏报。
+    #[test]
+    fn zcode_first_scan_waiting_historical_ts_is_silent_then_realtime_notifies() {
+        let now = 10_000_000_000_000u64;
+        let old_updated = now - 1_800_000; // 会话 30 分钟前更新
+        // 两轮 poll 之间要改库，用临时文件库（poller 只读打开，改动走另一连接）
+        let dir = std::env::temp_dir().join(format!("ab-lib-zc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("scan.sqlite");
+        let con = rusqlite::Connection::open(&db).unwrap();
+        con.execute_batch(
+            r#"CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT,
+                time_created INTEGER, time_updated INTEGER, last_outcome TEXT,
+                time_deleted INTEGER, time_archived INTEGER);
+            CREATE TABLE session_runtime_presence (session_id TEXT, owner_id TEXT, process_id INTEGER);
+            CREATE TABLE turn_usage (id INTEGER PRIMARY KEY, session_id TEXT, status TEXT,
+                error_type TEXT, started_at INTEGER, completed_at INTEGER);"#,
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session (id,title,directory,time_created,time_updated) VALUES ('z1','t',?1,?2,?2)",
+            rusqlite::params![r"C:\repo\z", old_updated],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
+            [],
+        )
+        .unwrap();
+        drop(con);
+
+        // 首扫：presence 存活 + turn 全完成 → Waiting（ts = time_updated 历史时间）
+        let mut p = crate::collectors::zcode_db::ZcodePoller::open(&db).unwrap();
+        let events = p.poll(now);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                UnifiedEvent::Waiting { ts, .. } if *ts == old_updated as u64
+            )),
+            "首扫 Waiting 带会话历史时间而非轮询时刻"
+        );
+
+        let mut m = Machine::new(DONE_AFTER);
+        let mut ups = Vec::new();
+        for e in &events {
+            ups.extend(m.process(e));
+        }
+        let waiting = ups
+            .iter()
+            .find(|u| u.snapshot.status == SessionStatus::Waiting(WaitingKind::Idle))
+            .expect("首扫活会话应判等待·空闲而非 Done");
+        assert!(
+            ups.iter().any(|u| u.should_notify),
+            "machine 不知道启动时刻，会请求通知"
+        );
+        assert_eq!(waiting.snapshot.last_activity, old_updated as u64);
+        assert!(
+            !notification_allowed(waiting.snapshot.last_activity, now),
+            "APP_START 闸拦截首扫 Waiting，不发通知"
+        );
+
+        // 首扫结束后（first_scan=false）turn 变为进行中 → Activity ts=now，实时信号放行
+        let con2 = rusqlite::Connection::open(&db).unwrap();
+        con2.execute(
+            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z1','completed',?1,NULL)",
+            [now as i64],
+        )
+        .unwrap();
+        drop(con2);
+        let events2 = p.poll(now + 4_000);
+        assert!(events2.iter().any(|e| matches!(
+            e,
+            UnifiedEvent::Activity { ts, .. } if *ts == now + 4_000
+        )));
+        let mut ups2 = Vec::new();
+        for e in &events2 {
+            ups2.extend(m.process(e));
+        }
+        let running = ups2
+            .iter()
+            .find(|u| u.snapshot.status == SessionStatus::Running)
+            .expect("实时 Activity 应回到运行中");
+        assert_eq!(running.snapshot.last_activity, now + 4_000);
+        assert!(
+            notification_allowed(running.snapshot.last_activity, now),
+            "实时活动（晚于启动时刻）放行通知"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

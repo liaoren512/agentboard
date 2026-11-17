@@ -7,9 +7,9 @@ use std::collections::HashMap;
 struct Row {
     title: String,
     directory: String,
-    last_outcome: Option<String>,
-    /// 会话真实历史时间（epoch ms）：历史推导的状态迁移（Discovered/Closed）带它当 ts，
-    /// 让启动回填被 lib.rs 的 APP_START 闸拦住，否则首扫历史会话按 ts=now 弹通知风暴。
+    /// 会话真实历史时间（epoch ms）：历史推导的状态迁移（Discovered/Closed）与首扫期的
+    /// Activity/Waiting/TurnFailed 都带它当 ts，让启动回填被 lib.rs 的 APP_START 闸拦住，
+    /// 否则首扫把历史状态伪装成实时变化（ts=now）弹通知风暴。
     time_updated: u64,
     presence: bool,
     latest_turn: Option<TurnRow>,
@@ -33,6 +33,9 @@ pub struct ZcodePoller {
     con: rusqlite::Connection,
     known: std::collections::HashSet<String>,
     prev: HashMap<String, ZStatus>,
+    /// 首扫（第一次 poll）在回放历史状态而非实时变化：期间 Activity/Waiting/TurnFailed
+    /// 的 ts 用会话 time_updated（历史时间 → 被 APP_START 闸静默），之后才用 now。
+    first_scan: bool,
 }
 
 impl ZcodePoller {
@@ -53,6 +56,7 @@ impl ZcodePoller {
             con,
             known: Default::default(),
             prev: Default::default(),
+            first_scan: true,
         })
     }
 
@@ -61,7 +65,7 @@ impl ZcodePoller {
         let mut rows: HashMap<String, Row> = HashMap::new();
 
         let Ok(mut stmt) = self.con.prepare(
-            "SELECT id, title, directory, last_outcome, time_updated FROM session WHERE time_deleted IS NULL AND time_archived IS NULL"
+            "SELECT id, title, directory, time_updated FROM session WHERE time_deleted IS NULL AND time_archived IS NULL"
         ) else { return out };
         let _ = stmt
             .query_map([], |r| {
@@ -69,19 +73,17 @@ impl ZcodePoller {
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
                     // 真实库 NOT NULL；防御 NULL/负值退 0（必被启动闸拦截，安全侧）
-                    r.get::<_, Option<i64>>(4)?.unwrap_or_default().max(0) as u64,
+                    r.get::<_, Option<i64>>(3)?.unwrap_or_default().max(0) as u64,
                 ))
             })
             .map(|it| {
-                for (id, title, directory, last_outcome, time_updated) in it.flatten() {
+                for (id, title, directory, time_updated) in it.flatten() {
                     rows.insert(
                         id,
                         Row {
                             title,
                             directory,
-                            last_outcome,
                             time_updated,
                             presence: false,
                             latest_turn: None,
@@ -133,14 +135,10 @@ impl ZcodePoller {
                     {
                         ZStatus::Failed
                     }
-                    // last_outcome 明确完成 → 已完成（接口："last_outcome IN ('completed','interrupted') 或从 presence 消失 → Closed"）
-                    _ if matches!(
-                        row.last_outcome.as_deref(),
-                        Some("completed") | Some("interrupted")
-                    ) =>
-                    {
-                        ZStatus::Closed
-                    }
+                    // presence 存活 + turn 全完成 → 等待·空闲（进"需处理"组）。
+                    // 教训：曾在这里按 last_outcome 判 Closed，而 ZCode 每轮结束都写
+                    // last_outcome='completed' → 活会话几乎永远被误标"完成"，
+                    // 等待/运行/失败永不出现。只有 presence 消失才算 Closed。
                     _ => ZStatus::IdleWaiting,
                 }
             } else {
@@ -159,32 +157,41 @@ impl ZcodePoller {
                     ts: row.time_updated,
                 });
             }
-            // Activity/Waiting/TurnFailed 是 presence 存活会话的实时信号，保持 ts=now 照常通知；
-            // Closed（历史推导）用会话 time_updated，见上方 Row 注释。
+            // Activity/Waiting/TurnFailed 是 presence 存活会话的信号：首扫是历史状态回放，
+            // ts 用会话 time_updated（被 APP_START 闸静默）；之后才是实时变化，ts=now 照常通知。
+            // Closed（presence 消失，历史推导）始终用会话 time_updated，见上方 Row 注释。
+            // 首扫发现"存活且进行中"的会话走 Discovered(ts=历史) + Activity(ts=历史) →
+            // machine 置 Running、last_activity=历史 → 首个 Tick 立即推断 Done（静默）；
+            // 而真正的实时运行（非首扫期）Activity ts=now，阈值内不会被 Tick 误推断。
+            let live_ts = if self.first_scan {
+                row.time_updated
+            } else {
+                now
+            };
             let prev = self.prev.get(&id);
             match (&z, prev) {
                 (ZStatus::Running, Some(ZStatus::Running)) => {}
                 (ZStatus::Running, _) => out.push(UnifiedEvent::Activity {
                     agent,
                     session_id: id.clone(),
-                    ts: now,
+                    ts: live_ts,
                 }),
                 (ZStatus::IdleWaiting, Some(ZStatus::IdleWaiting)) => {}
                 (ZStatus::IdleWaiting, _) => out.push(UnifiedEvent::Waiting {
                     agent,
                     session_id: id.clone(),
                     kind: WaitingKind::Idle,
-                    ts: now,
+                    ts: live_ts,
                 }),
                 (ZStatus::Failed, Some(ZStatus::Failed)) => {}
                 (ZStatus::Failed, _) => out.push(UnifiedEvent::TurnFailed {
                     agent,
                     session_id: id.clone(),
-                    ts: now,
+                    ts: live_ts,
                 }),
                 (ZStatus::Closed, Some(ZStatus::Closed)) => {}
-                // 历史推导的关闭（presence 消失 / last_outcome 完成）：ts 带会话
-                // time_updated（真实历史时间）→ 启动首扫被 APP_START 闸静默，不再通知风暴
+                // 历史推导的关闭（presence 消失）：ts 带会话 time_updated（真实历史时间）
+                // → 启动首扫被 APP_START 闸静默，不再通知风暴
                 (ZStatus::Closed, _) => out.push(UnifiedEvent::Closed {
                     agent,
                     session_id: id.clone(),
@@ -193,6 +200,7 @@ impl ZcodePoller {
             }
             self.prev.insert(id, z);
         }
+        self.first_scan = false; // 首扫结束，之后的信号才是实时变化
         out
     }
 }
@@ -308,21 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn presence_gone_or_last_outcome_closes() {
-        let con = fixture_db();
-        insert_session(&con, "z1", Some("completed"), 50);
-        con.execute(
-            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
-            [],
-        )
-        .unwrap();
-        let mut p = ZcodePoller::with_connection(con).unwrap();
-        let ev = p.poll(100);
-        assert!(
-            ev.iter()
-                .any(|e| matches!(e, UnifiedEvent::Closed { session_id, ts, .. } if session_id=="z1" && *ts == 50))
-        );
-
+    fn presence_gone_closes() {
         let con2 = fixture_db();
         insert_session(&con2, "z2", None, 50);
         let mut p2 = ZcodePoller::with_connection(con2).unwrap();
@@ -332,6 +326,94 @@ mod tests {
                 .any(|e| matches!(e, UnifiedEvent::Closed { session_id, ts, .. } if session_id=="z2" && *ts == 50)),
             "无 presence 即关闭，ts 是会话历史时间而非轮询时刻"
         );
+    }
+
+    /// 回归（验收缺陷：活会话误判 Done）：presence 存活 + last_outcome=completed +
+    /// turn 全完成 → 等待·空闲（进"需处理"组），绝不是 Closed/Done——
+    /// ZCode 每轮结束都写 last_outcome='completed'，按它判关会把活会话几乎永远标成完成。
+    #[test]
+    fn presence_with_completed_outcome_is_idle_waiting_not_closed() {
+        let con = fixture_db();
+        insert_session(&con, "z1", Some("completed"), 50);
+        con.execute(
+            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z1','completed',10,20)",
+            [],
+        )
+        .unwrap();
+        let mut p = ZcodePoller::with_connection(con).unwrap();
+        let ev = p.poll(100);
+        assert!(
+            ev.iter().any(|e| matches!(
+                e,
+                UnifiedEvent::Waiting { session_id, kind: WaitingKind::Idle, .. } if session_id=="z1"
+            )),
+            "presence 存活 + turn 全完成 → 等待·空闲"
+        );
+        assert!(
+            !ev.iter().any(|e| matches!(e, UnifiedEvent::Closed { .. })),
+            "presence 存活绝不产 Closed"
+        );
+    }
+
+    /// 回归（首扫回填语义）：首扫是历史状态回放，Activity/Waiting 的 ts 必须是会话
+    /// time_updated（被 APP_START 闸静默）；首扫结束后才是实时变化，ts=now。
+    #[test]
+    fn first_scan_uses_historical_ts_then_realtime_now() {
+        // 两轮 poll 之间要改库，用临时文件库（poller 只读打开，改动走另一连接）
+        let dir = std::env::temp_dir().join(format!("ab-zc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("scan.sqlite");
+        let con = Connection::open(&db).unwrap();
+        con.execute_batch(
+            r#"CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, directory TEXT,
+                time_created INTEGER, time_updated INTEGER, last_outcome TEXT,
+                time_deleted INTEGER, time_archived INTEGER);
+            CREATE TABLE session_runtime_presence (session_id TEXT, owner_id TEXT, process_id INTEGER);
+            CREATE TABLE turn_usage (id INTEGER PRIMARY KEY, session_id TEXT, status TEXT,
+                error_type TEXT, started_at INTEGER, completed_at INTEGER);"#,
+        )
+        .unwrap();
+        insert_session(&con, "z1", None, 50);
+        con.execute(
+            "INSERT INTO session_runtime_presence VALUES ('z1','o',1)",
+            [],
+        )
+        .unwrap();
+        drop(con);
+        let mut p = ZcodePoller::open(&db).unwrap();
+        // 首扫：turn 全完成 → Waiting，ts = time_updated=50，不是轮询时刻 999_000
+        let ev = p.poll(999_000);
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            UnifiedEvent::Waiting { ts, .. } if *ts == 50
+        )));
+        assert!(
+            !ev.iter().any(|e| matches!(
+                e,
+                UnifiedEvent::Waiting { ts, .. } if *ts == 999_000
+            )),
+            "首扫 Waiting 不得伪装成实时变化（ts=now）"
+        );
+
+        // 首扫后 turn 变为进行中 → 状态变化产 Activity，ts = now（实时信号）
+        let con2 = Connection::open(&db).unwrap();
+        con2.execute(
+            "INSERT INTO turn_usage (session_id,status,started_at,completed_at) VALUES ('z1','completed',900,NULL)",
+            [],
+        )
+        .unwrap();
+        drop(con2);
+        let ev2 = p.poll(999_000_000);
+        assert!(ev2.iter().any(|e| matches!(
+            e,
+            UnifiedEvent::Activity { ts, .. } if *ts == 999_000_000
+        )));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 回归（验收缺陷：启动通知风暴）：无 presence 的历史会话首扫判 Closed 时，
