@@ -129,7 +129,13 @@ impl Machine {
                         e.snap.status = new_status.clone();
                         e.snap.last_activity = e.snap.last_activity.max(*ts);
                     }
-                    e.snap.waiting_reason = reason.clone(); // "在等什么"
+                    // Some-优先（审查修复）：同一权限等待期内 PermissionRequest（reason=
+                    // Some(tool_summary)）与 Notification（reason=None）都会触发且顺序不定，
+                    // None 不得抹掉已记录的摘要；None 只在尚无摘要时写入。清空统一由
+                    // Activity/Discovered（双清）与 TurnFinished 负责（新一轮边界）。
+                    if reason.is_some() || e.snap.waiting_reason.is_none() {
+                        e.snap.waiting_reason = reason.clone(); // "在等什么"
+                    }
                     e.snap.reply_head = None; // 上一轮摘要随新一轮作废
                     let notify = e.notified.as_ref() != Some(&new_status);
                     if notify {
@@ -507,5 +513,67 @@ mod tests {
         assert_eq!(ups[0].snapshot.status, SessionStatus::Done);
         assert!(ups[0].snapshot.done_inferred);
         assert_eq!(ups[0].snapshot.reply_head, None);
+    }
+
+    /// 审查修复回归：同一权限等待期内 PermissionRequest（reason=Some）与 Notification
+    /// （reason=None）都触发且顺序不定，None 不得抹掉已记录的 Some。
+    #[test]
+    fn waiting_reason_survives_none_reason_waiting_events() {
+        let mut m = Machine::new(DONE_AFTER);
+        m.process(&disc(AgentKind::ClaudeCode, "s1", TS));
+
+        // 顺序一：Permission(Some) 先到，Notification(None) 后到 → 摘要保留
+        m.process(&UnifiedEvent::Waiting {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            kind: WaitingKind::Permission,
+            reason: Some("git push origin main".into()),
+            ts: TS,
+        });
+        let ups = m.process(&UnifiedEvent::Waiting {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            kind: WaitingKind::Permission,
+            reason: None,
+            ts: TS + 1,
+        });
+        assert_eq!(
+            ups[0].snapshot.waiting_reason.as_deref(),
+            Some("git push origin main"),
+            "同等待期内 None 不抹掉 Some"
+        );
+
+        // 顺序二：None 先到，Some 后到 → Some 生效
+        m.process(&UnifiedEvent::Activity {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            ts: TS + 2,
+        });
+        m.process(&UnifiedEvent::Waiting {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            kind: WaitingKind::Permission,
+            reason: None,
+            ts: TS + 3,
+        });
+        let ups = m.process(&UnifiedEvent::Waiting {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            kind: WaitingKind::Permission,
+            reason: Some("cargo test".into()),
+            ts: TS + 4,
+        });
+        assert_eq!(
+            ups[0].snapshot.waiting_reason.as_deref(),
+            Some("cargo test")
+        );
+
+        // 清空边界不受影响：Activity 仍双清（新一轮等待期从零开始）
+        let ups = m.process(&UnifiedEvent::Activity {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            ts: TS + 5,
+        });
+        assert_eq!(ups[0].snapshot.waiting_reason, None);
     }
 }

@@ -44,7 +44,9 @@ impl HookEventsPoller {
             let Some(ts) = v.get("ts").and_then(|x| x.as_u64()) else {
                 continue;
             };
-            // v0.1.3：按事件行 event 字段分派；无 event 的旧文件 kind-only 行走兼容路径
+            // v0.1.3：按事件行 event 字段分派。Notification 行（events_file 自 v0.1.3 起
+            // 补 event:"notification"）与旧文件 kind-only 行（无 event 字段）同走既有
+            // Waiting(kind) 路径——否则升级后 idle 等待检测端到端断裂（审查修复）。
             match v.get("event").and_then(|x| x.as_str()) {
                 Some("permission_request") => {
                     let reason = v
@@ -71,8 +73,7 @@ impl HookEventsPoller {
                         ts,
                     });
                 }
-                Some(_) => continue, // 未识别 event → 跳过
-                None => {
+                Some("notification") | None => {
                     let kind = match v.get("kind").and_then(|x| x.as_str()).unwrap_or("") {
                         "permission_prompt" => WaitingKind::Permission,
                         "idle_prompt" => WaitingKind::Idle,
@@ -86,6 +87,7 @@ impl HookEventsPoller {
                         ts,
                     });
                 }
+                Some(_) => continue, // 未识别 event → 跳过
             }
         }
         self.offset = end as u64;
@@ -169,6 +171,43 @@ mod tests {
             UnifiedEvent::TurnFinished {
                 reply_head: None,
                 ts: 70,
+                ..
+            }
+        ));
+        std::fs::remove_file(&f).unwrap();
+    }
+
+    // 审查修复回归：v0.1.3 起 events_file 给 Notification 行补 event:"notification"，
+    // 必须仍走既有 kind-only Waiting 路径（曾有 Some(_) => continue 把它整类丢掉，
+    // idle 等待检测端到端断裂）。
+    #[test]
+    fn notification_event_lines_still_reach_waiting_path() {
+        let f = std::env::temp_dir().join(format!("ab-he7-{}.jsonl", std::process::id()));
+        let lines = concat!(
+            r#"{"agent":"claude-code","sessionId":"s6","event":"notification","kind":"idle_prompt","ts":100}"#,
+            "\n",
+            r#"{"agent":"claude-code","sessionId":"s7","event":"notification","kind":"permission_prompt","ts":101}"#,
+            "\n",
+        );
+        std::fs::write(&f, lines).unwrap();
+        let mut p = HookEventsPoller::new(f.clone());
+        let ev = p.poll();
+        assert_eq!(ev.len(), 2, "带 event:\"notification\" 的行必须消费");
+        assert!(matches!(
+            &ev[0],
+            UnifiedEvent::Waiting {
+                kind: WaitingKind::Idle,
+                reason: None,
+                ts: 100,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &ev[1],
+            UnifiedEvent::Waiting {
+                kind: WaitingKind::Permission,
+                reason: None,
+                ts: 101,
                 ..
             }
         ));
