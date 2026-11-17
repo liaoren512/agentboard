@@ -166,3 +166,7 @@ hook 的 stdin 输入含 `session_id`、`transcript_path`、`cwd`、`message` �
 2. **历史 1000 条仅存档**：history.sqlite 正常写入并保留最近 1000 条，但重启应用后不回填到看板
 3. **托盘叠加数字未做**：§3.3 设计的"托盘图标叠加两个数字"未实现，计数以托盘菜单文本呈现（「等待 N · 运行 N」）
 4. **无日志文件**：§3.4 数据布局中的 `logs/agentboard.log` 未实现
+
+## v0.1.1 实现偏差注记
+
+1. **设置页两阈值曾未接线（本版修复）**：running_fresh_ms / done_after_ms 在 v0.1.0 仅存 config.json 不生效；v0.1.1 起 ZCode 运行中判定改用 time_updated 新鲜度（running_fresh_ms 每次 poll 前注入 ZcodePoller）、完成推断阈值 done_after_ms 每次注入 Tick 前注入 Machine，设置页保存后实时生效。判定精化（复审）：用 latest turn 的 completed_at 与 time_updated 先后（1s 容差）区分"刚结束"与"又开始了"——回合结束即最后事件时终态立即落定（error→Failed / completed→IdleWaiting，不被新鲜窗口延迟），结束后又有新活动且新鲜才判 Running

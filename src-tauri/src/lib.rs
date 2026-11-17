@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
-/// R8 的通知门控已在 send_notification 接线（读 notify_enabled）；
-/// config 的两个阈值（running_fresh_ms / done_after_ms）v1 预留未接线，Machine 固定用 15 分钟完成推断阈值。
-const DEFAULT_DONE_AFTER_MS: u64 = 15 * 60 * 1000;
+/// 通知开关与两个阈值（notify_enabled / running_fresh_ms / done_after_ms）均已接线：
+/// 通知在 send_notification 读取；done_after_ms 在 core 循环每次注入 Tick 前重读 config
+/// 注入 Machine（spawn_core），running_fresh_ms 在 zcode 采集线程每次 poll 前重读注入
+/// ZcodePoller（spawn_zcode_poller）——设置页保存后实时生效。
 const TRAY_ID: &str = "agentboard-tray";
 
 /// 应用启动时刻（epoch ms，run() 里记一次）。启动首扫会把历史数据当事件回放，
@@ -232,6 +233,9 @@ fn spawn_zcode_poller(tx: mpsc::Sender<UnifiedEvent>) {
                 }
             }
             if let Some(p) = poller.as_mut() {
+                // 运行中判定窗口实时生效：每次 poll 前读一次 config（本地小 JSON，4s 一次可接受）
+                let cfg = core::config::load();
+                p.set_running_fresh_ms(cfg.running_fresh_ms);
                 send_all(&tx, p.poll(now_ms()));
             }
             std::thread::sleep(Duration::from_secs(4));
@@ -359,6 +363,13 @@ fn spawn_core(
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if last_tick.elapsed() >= Duration::from_secs(5) {
                         last_tick = Instant::now();
+                        // 完成推断阈值实时生效：每次注入 Tick 前读一次 config
+                        //（本地小 JSON，5s 一次可接受）
+                        let cfg = core::config::load();
+                        machine
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .set_done_after_ms(cfg.done_after_ms);
                         handle_event(
                             &app,
                             &machine,
@@ -378,7 +389,9 @@ fn spawn_core(
 pub fn run() {
     let _ = APP_START_MS.set(now_ms()); // 启动时刻记一次：回填闸基准
     let (tx, rx) = mpsc::channel::<UnifiedEvent>();
-    let machine = Arc::new(Mutex::new(Machine::new(DEFAULT_DONE_AFTER_MS)));
+    // 启动时读一次 config 作初始阈值（load 失败退默认 15 分钟）；此后 core 循环每次
+    // 注入 Tick 前重读 config 覆盖，设置页改动实时生效
+    let machine = Arc::new(Mutex::new(Machine::new(core::config::load().done_after_ms)));
     let history = Arc::new(Mutex::new(
         match History::open(&agentboard_dir().join("history.sqlite")) {
             Ok(h) => h,
