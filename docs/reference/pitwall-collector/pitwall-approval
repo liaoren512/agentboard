@@ -1,0 +1,201 @@
+#!/bin/sh
+# pitwall-approval：把 Claude Code / Codex / Devin / Qoder CN / ZCode 的审批请求与提问交给 Pitwall。
+#
+#   pitwall-approval claude-code    # PermissionRequest 的 payload 从 stdin 传入
+#   pitwall-approval codex          # Codex 在 hook 返回后才显示原生审批框
+#   pitwall-approval devin          # Devin 同样在 hook 返回后才显示原生审批框
+#   pitwall-approval qoder-cn       # 独立桌面版：PermissionRequest 审批、PreToolUse 提问
+#   pitwall-approval zcode          # 桌面原生 Agent：PermissionRequest 审批与结构化回答
+#
+# Pi 没有 hook 审批：它的审批框来自其它扩展，由 Pitwall 的 Pi 扩展（pi/pitwall.ts）按同一文件格式接管。
+#
+# 提问（answer_format=answers-v1）：Claude Code / ZCode 的 AskUserQuestion 走 PermissionRequest，回答作为 updatedInput；
+# Codex 的 request_user_input、Devin 的 ask_user_question 走 PreToolUse（只为这两个工具登记），
+# 它们没有填入回答的输入字段，所以阻止这次调用、把用户的回答写进原因交给模型，不再显示原生提问。
+#
+# Claude Code 运行这个 hook 的同时照常显示终端里的审批框，两边谁先回答算谁的：
+# - Pitwall 没在运行（~/.pitwall/approvals/listening 超过 6 秒没更新）：立即退出、不输出，什么都不改变。
+# - 你在 Pitwall 里回答：输出 allow / deny，终端审批框随之关闭。
+# - 你在终端里回答：pitwall-hook 收到后续事件时删掉这次请求，本脚本随即退出、不输出。
+# 请求文件只在本机，处理完即删除。内部接口，格式可能随版本变化。
+# 桌面 App 启动的 agent 的 PATH 很短，这里只用绝对路径的系统命令。
+
+agent=${1:-}
+dir="${PITWALL_HOME:-$HOME/.pitwall}/approvals"
+JQ=/usr/bin/jq
+LIMIT=900          # 最长等待秒数；登记的 hook timeout 略长于它
+
+payload=$(/bin/cat)
+[ -x "$JQ" ] || exit 0
+case "$agent" in claude-code | codex | devin | qoder-cn | zcode) ;; *) exit 0 ;; esac
+# ZCode requires exact turn/call identities for both tool approvals and questions.
+if [ "$agent" = zcode ]; then
+  printf '%s' "$payload" | "$JQ" -e '.hook_event_name == "PermissionRequest"
+    and (.turnId | type == "string" and test("^[A-Za-z0-9_.-]{1,128}$"))
+    and (.tool_use_id | type == "string" and test("^[A-Za-z0-9_.:-]{1,80}$"))' >/dev/null 2>&1 || exit 0
+fi
+# 与 Qoder CN 的状态采集边界一致：不接管子 Agent 请求；仅接管这两个决策事件。
+if [ "$agent" = qoder-cn ]; then
+  printf '%s' "$payload" | "$JQ" -e '
+    .agent_id == null and (.hook_event_name == "PermissionRequest" or .hook_event_name == "PreToolUse")' >/dev/null 2>&1 || exit 0
+fi
+
+listening() {
+  beat=$(/usr/bin/stat -f %m "$dir/listening" 2>/dev/null) || return 1
+  [ $(($(/bin/date +%s) - beat)) -le 6 ]
+}
+listening || exit 0
+
+# 文件名带上会话与工具；撤回时再核对调用 ID 或完整输入的指纹，不能只按工具名删除。
+# 事件名、会话、工具名一次取出：会话不安全时整行为空。
+fields=$(printf '%s' "$payload" | "$JQ" -r '
+  def safe: if type == "string" and test("^[A-Za-z0-9_.-]{1,128}$") then . else empty end;
+  [(.hook_event_name // "" | tostring | gsub("[^A-Za-z]"; "")), (.session_id | safe),
+   (.tool_name // "" | tostring | gsub("[^A-Za-z0-9_]"; "_") | .[0:64])] | select(length == 3) | join(" ")' 2>/dev/null)
+[ -n "$fields" ] || exit 0
+event=${fields%% *}
+rest=${fields#* }
+session=${rest% *}
+tool=${rest#* }
+
+# PreToolUse 只为提问工具登记；其它工具（matcher 失效时）立即放行，不写请求、不等待。
+# Codex / Devin 的提问只经 PreToolUse 交给 Pitwall：它们的 PermissionRequest 在 Pitwall 里
+# 既不能回答也不能批准，立即交回原生界面，不让它白等 60 秒。
+question=false
+case "$agent:$event:$tool" in
+  claude-code:PermissionRequest:AskUserQuestion | zcode:PermissionRequest:AskUserQuestion | codex:PreToolUse:request_user_input | devin:PreToolUse:ask_user_question | qoder-cn:PreToolUse:AskUserQuestion) question=true ;;
+  codex:PermissionRequest:request_user_input | devin:PermissionRequest:ask_user_question | qoder-cn:PermissionRequest:AskUserQuestion | *:PreToolUse:*) exit 0 ;;
+esac
+
+# 未知的 Qoder 提问格式直接回原生卡片，避免没有可填写的表单却等待 60 秒。
+if [ "$agent" = qoder-cn ] && [ "$question" = true ]; then
+  printf '%s' "$payload" | "$JQ" -e '
+    .tool_input.questions as $q
+    | ($q | type) == "array" and ($q | length) > 0 and ($q | length) <= 4
+      and all($q[]; (.question | type) == "string" and (.question | length) > 0
+        and (.id == null or (.id | type) == "string")
+        and (.header == null or (.header | type) == "string")
+        and (.multiSelect == null or (.multiSelect | type) == "boolean")
+        and (.multi_select == null or (.multi_select | type) == "boolean")
+        and (.allowOther == null or (.allowOther | type) == "boolean")
+        and (.options | type) == "array" and (.options | length) > 0
+        and all(.options[]; (.label | type) == "string" and (.label | length) > 0
+          and (.description == null or (.description | type) == "string"))
+        and ([.options[].label] | unique | length) == (.options | length))
+      and ([$q[].question] | unique | length) == ($q | length)' >/dev/null 2>&1 || exit 0
+fi
+
+# ZCode's native questions accept answers keyed by question text. Unsupported visual previews
+# stay in ZCode: the shared Pitwall form cannot show the artifact the user is choosing.
+if [ "$agent" = zcode ] && [ "$question" = true ]; then
+  printf '%s' "$payload" | "$JQ" -e '
+    .tool_input.questions as $q
+    | ($q | type) == "array" and ($q | length) >= 1 and ($q | length) <= 4
+      and all($q[]; (.question | type) == "string" and (.question | test("\\S"))
+        and (.header | type) == "string"
+        and (.multiSelect == null or (.multiSelect | type) == "boolean")
+        and (.options | type) == "array" and (.options | length) >= 2 and (.options | length) <= 4
+        and all(.options[]; (.label | type) == "string" and (.label | test("\\S"))
+          and (.description | type) == "string" and (has("preview") | not))
+        and ([.options[].label] | unique | length) == (.options | length))
+      and ([$q[].question] | unique | length) == ($q | length)' >/dev/null 2>&1 || exit 0
+fi
+
+# Codex 的自动审查也触发 PermissionRequest。只接管明确交给用户的当前轮，
+# 缺少 metadata / 元数据太远 / 格式未知时立即交回 Codex，不延迟自动审查。
+# 只读日志末尾至多 1 MiB；不把 rollout 正文或 reviewer 写到 spool。
+# 提问总是交给用户回答，没有自动审查，不检查 reviewer。
+if [ "$agent" = codex ] && [ "$question" = false ]; then
+  turn=$(printf '%s' "$payload" | "$JQ" -r '.turn_id | select(type == "string" and length > 0)' 2>/dev/null)
+  transcript=$(printf '%s' "$payload" | "$JQ" -r '.transcript_path | select(type == "string")' 2>/dev/null)
+  [ -n "$turn" ] && [ -f "$transcript" ] && [ -r "$transcript" ] || exit 0
+  reviewer=$(/usr/bin/tail -c 1048576 "$transcript" 2>/dev/null | "$JQ" -Rr --arg turn "$turn" '
+    fromjson? | select(.type == "turn_context" and .payload.turn_id == $turn)
+    | .payload.approvals_reviewer // "unknown"' 2>/dev/null | /usr/bin/tail -n 1)
+  [ "$reviewer" = user ] || exit 0
+fi
+
+# Codex 与 Devin 等 hook 返回才显示原生审批框 / 提问，所以最多等 60 秒。
+[ "$agent" = claude-code ] || LIMIT=60
+
+# Devin 的打印模式（-p / --print，包括 -pPROMPT / --print=PROMPT）不接管，免得脚本白等。
+# hook 的父进程就是 devin；只看 `--` 之前的参数，不把 prompt 里的 -p 当成选项。
+if [ "$agent" = devin ]; then
+  args=$(/bin/ps -o args= -p "$PPID" 2>/dev/null) || exit 0
+  case " ${args%% -- *} " in *" -p"* | *" --print "* | *" --print="*) exit 0 ;; esac
+fi
+
+scope=$session
+[ "$agent" = claude-code ] || scope="$agent.$session"
+id="$(/bin/date +%s)-$$"
+request="$dir/requests/$scope.$tool.$id.json"
+decision="$dir/decisions/$id"
+
+# Claude Code 原生提问框答完后，PostToolUse 的输入多出 answers / annotations；指纹不含这两项，
+# 否则没有调用 ID 的提问请求永远撤不回。与 pitwall-hook 的同一段一字不差，两边一起改。
+canonical=$(printf '%s' "$payload" | "$JQ" -cS '
+  select((.tool_name | type) == "string" and (.tool_input | type) == "object")
+  | [.tool_name, (if .tool_name == "AskUserQuestion" then .tool_input | del(.answers, .annotations) else .tool_input end)]' 2>/dev/null)
+[ -n "$canonical" ] || exit 0
+input_hash=$(printf '%s' "$canonical" | /usr/bin/shasum -a 256 | /usr/bin/cut -d ' ' -f 1)
+
+/bin/mkdir -p "$dir/requests" "$dir/decisions" 2>/dev/null && /bin/chmod 700 "$dir" 2>/dev/null || exit 0
+# 相同输入在一个会话中再次请求时，迟到的旧完成事件无法与新调用区分。
+# 原子创建标记；重复标记一直保留到 SessionEnd，不能随着单条请求的清理而重置。
+correlation="$dir/requests/$scope.$input_hash.seen"
+if [ "$agent" != zcode ] && ! /bin/mkdir "$correlation" 2>/dev/null; then
+  /usr/bin/touch "$correlation/repeated" 2>/dev/null || exit 0
+fi
+# Devin 的 payload 不带 cwd 与 turn_id：用它设置的 DEVIN_PROJECT_DIR，轮次用每次提交轮换的 prompt_id。
+printf '%s' "$payload" | "$JQ" -c --arg id "$id" --arg agent "$agent" --argjson pid "$$" --arg hash "$input_hash" \
+  --arg project "${DEVIN_PROJECT_DIR:-}" --argjson question "$question" '
+  def cap: if (tojson | length) > 4000 then {_truncated: (tojson | .[0:4000])} else . end;
+  {v: 1, id: $id, agent: $agent, created_at: now, pid: $pid, session_id,
+   turn_id: (if $agent == "devin" then .prompt_id elif $agent == "qoder-cn" then .request_set_id elif $agent == "zcode" then .turnId else .turn_id end),
+   cwd: (.cwd // (if $agent == "devin" and $project != "" then $project else null end)),
+   answer_format: (if $question then "answers-v1" else null end),
+   permission_mode, tool_name, tool_input: (if $question then .tool_input else (.tool_input | cap) end),
+   tool_use_id: (.tool_use_id | if type == "string" and length > 0 then . else null end),
+   tool_input_sha256: $hash}
+  | with_entries(select(.value != null))' > "$request.tmp" 2>/dev/null &&
+  /bin/mv "$request.tmp" "$request" || { /bin/rm -f "$request.tmp"; exit 0; }
+
+cleanup() { /bin/rm -f "$request" "$decision"; }
+trap 'cleanup; exit 0' HUP INT TERM
+
+start=$(/bin/date +%s)
+while :; do
+  # 撤回、退出或超时优先于迟到的决定；旧卡片不能恢复已结束的调用。
+  [ -f "$request" ] && listening && [ $(($(/bin/date +%s) - start)) -lt "$LIMIT" ] || { cleanup; exit 0; }
+  if [ -f "$decision" ]; then
+    if [ "$question" = true ]; then
+      # Answer envelopes are valid only for this exact question request: every question answered, nothing extra.
+      # The uncapped payload goes through stdin: as an argument it could exceed ARG_MAX and drop the answer.
+      printf '%s' "$payload" | "$JQ" -c --arg agent "$agent" --slurpfile reply "$decision" '
+        .tool_input as $input | $reply[0].answers as $answers
+        | select(($input.questions | type) == "array" and ($input.questions | length) > 0)
+        | select(($answers | type) == "object")
+        | select(($answers | keys | sort) == ([$input.questions[].question] | sort))
+        | select(all($answers[]; type == "string" and test("\\S")))
+        # 与 pi/pitwall.ts 的 ANSWERED 一字不差；两边一起改。
+        | ("The user answered your questions in Pitwall. This is their reply, not an error: continue with these answers and do not ask again.\n"
+           + ($answers | tojson)) as $said
+        | if $agent == "claude-code" or $agent == "zcode" then
+            {hookSpecificOutput: {hookEventName: "PermissionRequest", decision: {
+              behavior: "allow", updatedInput: ($input + {answers: $answers})}}}
+          elif $agent == "codex" or $agent == "qoder-cn" then
+            {hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $said}}
+          else {decision: "block", reason: $said} end' 2>/dev/null
+      cleanup
+      exit 0
+    fi
+    answer=$(/usr/bin/head -c 16 "$decision")
+    cleanup
+    case "$answer" in
+      allow) printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}' ;;
+      deny) printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied in Pitwall."}}}' ;;
+    esac
+    exit 0
+  fi
+  /bin/sleep 0.2
+done
