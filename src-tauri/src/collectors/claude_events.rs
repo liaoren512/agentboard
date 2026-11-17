@@ -44,17 +44,49 @@ impl HookEventsPoller {
             let Some(ts) = v.get("ts").and_then(|x| x.as_u64()) else {
                 continue;
             };
-            let kind = match v.get("kind").and_then(|x| x.as_str()).unwrap_or("") {
-                "permission_prompt" => WaitingKind::Permission,
-                "idle_prompt" => WaitingKind::Idle,
-                _ => WaitingKind::Other,
-            };
-            out.push(UnifiedEvent::Waiting {
-                agent: AgentKind::ClaudeCode,
-                session_id: session_id.to_string(),
-                kind,
-                ts,
-            });
+            // v0.1.3：按事件行 event 字段分派；无 event 的旧文件 kind-only 行走兼容路径
+            match v.get("event").and_then(|x| x.as_str()) {
+                Some("permission_request") => {
+                    let reason = v
+                        .get("tool_summary")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string);
+                    out.push(UnifiedEvent::Waiting {
+                        agent: AgentKind::ClaudeCode,
+                        session_id: session_id.to_string(),
+                        kind: WaitingKind::Permission,
+                        reason,
+                        ts,
+                    });
+                }
+                Some("stop") => {
+                    let reply_head = v
+                        .get("reply_head")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string);
+                    out.push(UnifiedEvent::TurnFinished {
+                        agent: AgentKind::ClaudeCode,
+                        session_id: session_id.to_string(),
+                        reply_head,
+                        ts,
+                    });
+                }
+                Some(_) => continue, // 未识别 event → 跳过
+                None => {
+                    let kind = match v.get("kind").and_then(|x| x.as_str()).unwrap_or("") {
+                        "permission_prompt" => WaitingKind::Permission,
+                        "idle_prompt" => WaitingKind::Idle,
+                        _ => WaitingKind::Other,
+                    };
+                    out.push(UnifiedEvent::Waiting {
+                        agent: AgentKind::ClaudeCode,
+                        session_id: session_id.to_string(),
+                        kind,
+                        reason: None,
+                        ts,
+                    });
+                }
+            }
         }
         self.offset = end as u64;
         out
@@ -87,6 +119,85 @@ mod tests {
 
         // 同一行不重复消费
         assert!(p.poll().is_empty());
+        std::fs::remove_file(&f).unwrap();
+    }
+
+    // v0.1.3：event 字段分派
+    #[test]
+    fn permission_request_event_maps_to_waiting_with_reason() {
+        let f = std::env::temp_dir().join(format!("ab-he4-{}.jsonl", std::process::id()));
+        let line = r#"{"agent":"claude-code","sessionId":"s1","event":"permission_request","kind":"permission_prompt","tool_summary":"git push origin main","ts":50}"#;
+        std::fs::write(&f, format!("{line}\n")).unwrap();
+        let mut p = HookEventsPoller::new(f.clone());
+        let ev = p.poll();
+        assert!(matches!(
+            &ev[..],
+            [UnifiedEvent::Waiting {
+                kind: WaitingKind::Permission,
+                reason: Some(summary),
+                ts: 50,
+                ..
+            }] if summary == "git push origin main"
+        ));
+        std::fs::remove_file(&f).unwrap();
+    }
+
+    #[test]
+    fn stop_event_maps_to_turn_finished_with_reply_head() {
+        let f = std::env::temp_dir().join(format!("ab-he5-{}.jsonl", std::process::id()));
+        // 带 reply_head
+        let lines = concat!(
+            r#"{"agent":"claude-code","sessionId":"s2","event":"stop","reply_head":"构建已完成","ts":60}"#,
+            "\n",
+            r#"{"agent":"claude-code","sessionId":"s3","event":"stop","ts":70}"#,
+            "\n",
+        );
+        std::fs::write(&f, lines).unwrap();
+        let mut p = HookEventsPoller::new(f.clone());
+        let ev = p.poll();
+        assert_eq!(ev.len(), 2);
+        assert!(matches!(
+            &ev[0],
+            UnifiedEvent::TurnFinished {
+                reply_head: Some(head),
+                ts: 60,
+                ..
+            } if head == "构建已完成"
+        ));
+        assert!(matches!(
+            &ev[1],
+            UnifiedEvent::TurnFinished {
+                reply_head: None,
+                ts: 70,
+                ..
+            }
+        ));
+        std::fs::remove_file(&f).unwrap();
+    }
+
+    #[test]
+    fn unknown_event_name_is_skipped_but_legacy_lines_still_map() {
+        let f = std::env::temp_dir().join(format!("ab-he6-{}.jsonl", std::process::id()));
+        // 未识别 event → 跳过；无 event 字段（旧文件 kind-only 行）→ 兼容 Waiting
+        let lines = concat!(
+            r#"{"agent":"claude-code","sessionId":"s4","event":"mystery","ts":80}"#,
+            "\n",
+            r#"{"agent":"claude-code","sessionId":"s5","kind":"idle_prompt","ts":90}"#,
+            "\n",
+        );
+        std::fs::write(&f, lines).unwrap();
+        let mut p = HookEventsPoller::new(f.clone());
+        let ev = p.poll();
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(
+            &ev[0],
+            UnifiedEvent::Waiting {
+                kind: WaitingKind::Idle,
+                reason: None,
+                ts: 90,
+                ..
+            }
+        ));
         std::fs::remove_file(&f).unwrap();
     }
 

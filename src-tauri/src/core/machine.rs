@@ -76,6 +76,8 @@ impl Machine {
                             branch: branch_from_git(cwd),
                             status: SessionStatus::Running,
                             done_inferred: false,
+                            waiting_reason: None,
+                            reply_head: None,
                             last_activity: *ts,
                             time_created: *ts,
                         },
@@ -87,6 +89,9 @@ impl Machine {
                 entry.snap.status = SessionStatus::Running;
                 entry.snap.done_inferred = false;
                 entry.notified = None;
+                // 新一轮开始：等待原因与上一轮完成摘要一并清掉
+                entry.snap.waiting_reason = None;
+                entry.snap.reply_head = None;
                 entry.snap.last_activity = entry.snap.last_activity.max(*ts);
                 out.push(Update {
                     snapshot: entry.snap.clone(),
@@ -102,6 +107,8 @@ impl Machine {
                     e.snap.status = SessionStatus::Running;
                     e.snap.done_inferred = false;
                     e.notified = None; // 重新武装
+                    e.snap.waiting_reason = None; // 活动即不再等待
+                    e.snap.reply_head = None;
                     e.snap.last_activity = e.snap.last_activity.max(*ts);
                     out.push(Update {
                         snapshot: e.snap.clone(),
@@ -113,6 +120,7 @@ impl Machine {
                 agent,
                 session_id,
                 kind,
+                reason,
                 ts,
             } => {
                 if let Some(e) = self.get_mut(agent, session_id) {
@@ -121,6 +129,8 @@ impl Machine {
                         e.snap.status = new_status.clone();
                         e.snap.last_activity = e.snap.last_activity.max(*ts);
                     }
+                    e.snap.waiting_reason = reason.clone(); // "在等什么"
+                    e.snap.reply_head = None; // 上一轮摘要随新一轮作废
                     let notify = e.notified.as_ref() != Some(&new_status);
                     if notify {
                         e.notified = Some(new_status.clone());
@@ -154,12 +164,15 @@ impl Machine {
             UnifiedEvent::TurnFinished {
                 agent,
                 session_id,
+                reply_head,
                 ts,
             } => {
                 if let Some(e) = self.get_mut(agent, session_id) {
                     e.snap.status = SessionStatus::Done;
                     e.snap.done_inferred = false;
                     e.snap.last_activity = e.snap.last_activity.max(*ts);
+                    e.snap.reply_head = reply_head.clone(); // 真实完成摘要（Done 态展示）
+                    e.snap.waiting_reason = None; // 完成即不再等待
                     let notify = e.notified != Some(SessionStatus::Done);
                     if notify {
                         e.notified = Some(SessionStatus::Done);
@@ -266,6 +279,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             session_id: "s1".into(),
             kind: WaitingKind::Permission,
+            reason: None,
             ts: TS,
         });
         assert_eq!(
@@ -278,6 +292,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             session_id: "s1".into(),
             kind: WaitingKind::Permission,
+            reason: None,
             ts: TS + 1,
         });
         assert!(!ups[0].should_notify, "同一等待期内不重复通知");
@@ -292,6 +307,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             session_id: "s1".into(),
             kind: WaitingKind::Permission,
+            reason: None,
             ts: TS + 3,
         });
         assert!(ups[0].should_notify);
@@ -323,6 +339,7 @@ mod tests {
         let ups = m.process(&UnifiedEvent::TurnFinished {
             agent: AgentKind::ZCode,
             session_id: "z1".into(),
+            reply_head: None,
             ts: TS,
         });
         assert_eq!(ups[0].snapshot.status, SessionStatus::Done);
@@ -350,6 +367,7 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             session_id: "s1".into(),
             kind: WaitingKind::Idle,
+            reason: None,
             ts: TS,
         });
         let ups = m.process(&UnifiedEvent::Tick {
@@ -390,5 +408,104 @@ mod tests {
         let ups = m.process(&UnifiedEvent::Tick { now: TS + 1_000 });
         assert_eq!(ups.len(), 1);
         assert_eq!(ups[0].snapshot.status, SessionStatus::Done);
+    }
+
+    // v0.1.3：Waiting 存 waiting_reason / TurnFinished 置 reply_head / Activity 与 Discovered 双清
+    #[test]
+    fn waiting_stores_reason_and_activity_clears_both() {
+        let mut m = Machine::new(DONE_AFTER);
+        m.process(&disc(AgentKind::ClaudeCode, "s1", TS));
+        let ups = m.process(&UnifiedEvent::Waiting {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            kind: WaitingKind::Permission,
+            reason: Some("git push origin main".into()),
+            ts: TS,
+        });
+        assert_eq!(
+            ups[0].snapshot.waiting_reason.as_deref(),
+            Some("git push origin main")
+        );
+        assert_eq!(ups[0].snapshot.reply_head, None);
+
+        // Activity 双清
+        let ups = m.process(&UnifiedEvent::Activity {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            ts: TS + 1,
+        });
+        assert_eq!(ups[0].snapshot.status, SessionStatus::Running);
+        assert_eq!(ups[0].snapshot.waiting_reason, None);
+        assert_eq!(ups[0].snapshot.reply_head, None);
+    }
+
+    #[test]
+    fn turn_finished_stores_reply_head_and_clears_reason() {
+        let mut m = Machine::new(DONE_AFTER);
+        m.process(&disc(AgentKind::ClaudeCode, "s1", TS));
+        m.process(&UnifiedEvent::Waiting {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            kind: WaitingKind::Permission,
+            reason: Some("waiting for x".into()),
+            ts: TS,
+        });
+        let ups = m.process(&UnifiedEvent::TurnFinished {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            reply_head: Some("已完成构建并推送".into()),
+            ts: TS + 1,
+        });
+        assert_eq!(ups[0].snapshot.status, SessionStatus::Done);
+        assert!(!ups[0].snapshot.done_inferred);
+        assert_eq!(
+            ups[0].snapshot.reply_head.as_deref(),
+            Some("已完成构建并推送")
+        );
+        assert_eq!(ups[0].snapshot.waiting_reason, None, "完成即不再等待");
+        assert!(ups[0].should_notify);
+    }
+
+    #[test]
+    fn discovered_clears_stale_reason_and_reply_head() {
+        let mut m = Machine::new(DONE_AFTER);
+        m.process(&disc(AgentKind::ClaudeCode, "s1", TS));
+        m.process(&UnifiedEvent::TurnFinished {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            reply_head: Some("旧一轮摘要".into()),
+            ts: TS,
+        });
+        // 新一轮开始（转录写入 → Discovered）：双清
+        let ups = m.process(&disc(AgentKind::ClaudeCode, "s1", TS + 5));
+        assert_eq!(ups[0].snapshot.reply_head, None);
+        assert_eq!(ups[0].snapshot.waiting_reason, None);
+
+        // Activity 同样清残留
+        m.process(&UnifiedEvent::TurnFinished {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            reply_head: Some("old2".into()),
+            ts: TS + 6,
+        });
+        let ups = m.process(&UnifiedEvent::Activity {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            ts: TS + 7,
+        });
+        assert_eq!(ups[0].snapshot.reply_head, None);
+    }
+
+    /// 推不出不硬标：Tick 推断 Done 不产生 reply_head（真实摘要只来自 Stop 事件）。
+    #[test]
+    fn inferred_done_has_no_reply_head() {
+        let mut m = Machine::new(DONE_AFTER);
+        m.process(&disc(AgentKind::ClaudeCode, "s1", TS));
+        let ups = m.process(&UnifiedEvent::Tick {
+            now: TS + DONE_AFTER,
+        });
+        assert_eq!(ups[0].snapshot.status, SessionStatus::Done);
+        assert!(ups[0].snapshot.done_inferred);
+        assert_eq!(ups[0].snapshot.reply_head, None);
     }
 }

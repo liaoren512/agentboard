@@ -10,6 +10,11 @@ pub struct InstallReport {
     pub changed: bool,
 }
 
+/// v0.1.3 注册的三组事件。Notification 带 matcher（沿用既有）；PermissionRequest /
+/// Stop 不带 matcher——官方文档：PermissionRequest 省略 matcher = 所有工具触发，
+/// Stop 完全不支持 matcher（写了也会被忽略）。
+const HOOK_EVENTS: [&str; 3] = ["Notification", "PermissionRequest", "Stop"];
+
 pub fn install_hooks(
     hook_exe: &Path,
     settings_path: &Path,
@@ -28,7 +33,7 @@ pub fn install_hooks(
             "settings.json 顶层不是 JSON 对象",
         ));
     }
-    if group_present(&root) {
+    if HOOK_EVENTS.iter().all(|event| group_present(&root, event)) {
         return Ok(InstallReport {
             backup_path: PathBuf::new(),
             changed: false,
@@ -45,7 +50,7 @@ pub fn install_hooks(
         backup_path = backup_dir.join("settings.json");
     }
 
-    // 2) 合并（hooks / Notification 类型不对同样报错不 panic；此时已备份，原文件仍未动）
+    // 2) 合并（hooks / 各事件数组类型不对同样报错不 panic；此时已备份，原文件仍未动）
     let Some(obj) = root.as_object_mut() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -59,19 +64,28 @@ pub fn install_hooks(
             "settings.json 的 hooks 字段不是 JSON 对象",
         ));
     };
-    let notification = hooks_obj
-        .entry("Notification")
-        .or_insert_with(|| serde_json::json!([]));
-    let Some(groups) = notification.as_array_mut() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "settings.json 的 hooks.Notification 不是 JSON 数组",
-        ));
-    };
-    groups.push(serde_json::json!({
-        "matcher": MATCHER,
-        "hooks": [{ "type": "command", "command": exe_str, "args": ["notification"] }]
-    }));
+    // 逐事件 ensure（旧版本单组文件 → 只补缺的组，不重复）
+    let mut added = false;
+    for event in HOOK_EVENTS {
+        let group = if event == "Notification" {
+            serde_json::json!({
+                "matcher": MATCHER,
+                "hooks": [{ "type": "command", "command": exe_str, "args": ["notification"] }]
+            })
+        } else {
+            serde_json::json!({
+                "hooks": [{ "type": "command", "command": exe_str }]
+            })
+        };
+        added |= ensure_group(hooks_obj, event, group)?;
+    }
+    if !added {
+        // 前置检查已挡全存在的情况，此处防御：类型异常等导致的零改动按无变更返回
+        return Ok(InstallReport {
+            backup_path: PathBuf::new(),
+            changed: false,
+        });
+    }
 
     // 3) 写回（pretty，UTF-8）
     if let Some(parent) = settings_path.parent() {
@@ -85,31 +99,56 @@ pub fn install_hooks(
     })
 }
 
+/// 向某事件数组 ensure 一组我们的 hook：已存在（按标记识别）→ 不动；缺 → push。
+/// 事件已有值但不是数组 → InvalidData。
+fn ensure_group(
+    hooks_obj: &mut serde_json::Map<String, Value>,
+    event: &str,
+    group: Value,
+) -> std::io::Result<bool> {
+    let arr = hooks_obj
+        .entry(event.to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(groups) = arr.as_array_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("settings.json 的 hooks.{event} 不是 JSON 数组"),
+        ));
+    };
+    if groups.iter().any(|g| is_ours(g)) {
+        return Ok(false);
+    }
+    groups.push(group);
+    Ok(true)
+}
+
 pub fn uninstall_hooks(settings_path: &Path) -> std::io::Result<usize> {
     let text = std::fs::read_to_string(settings_path)?;
     let mut root: Value = serde_json::from_str(&text)?;
     let mut removed = 0;
-    if let Some(groups) = root["hooks"]["Notification"].as_array_mut() {
-        let before = groups.len();
-        groups.retain(|g| !is_ours(g));
-        removed = before - groups.len();
+    for event in HOOK_EVENTS {
+        if let Some(groups) = root["hooks"][event].as_array_mut() {
+            let before = groups.len();
+            groups.retain(|g| !is_ours(g));
+            removed += before - groups.len();
+        }
     }
     std::fs::write(settings_path, serde_json::to_string_pretty(&root)?)?;
     Ok(removed)
 }
 
-/// Notification 组里是否存在我们的 hook（供 Task 10 get_source_status 用）
+/// Notification 组里是否存在我们的 hook（供 get_source_status 用）
 pub fn ours_registered(settings_path: &Path) -> bool {
     std::fs::read_to_string(settings_path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .map(|root| group_present(&root))
+        .map(|root| group_present(&root, "Notification"))
         .unwrap_or(false)
 }
 
 // exe 路径变化视为同一组件；更新路径时先 uninstall 再 install，故只按标记识别组
-fn group_present(root: &Value) -> bool {
-    root["hooks"]["Notification"]
+fn group_present(root: &Value, event: &str) -> bool {
+    root["hooks"][event]
         .as_array()
         .map(|groups| groups.iter().any(|g| is_ours(g)))
         .unwrap_or(false)
@@ -195,6 +234,28 @@ mod tests {
                 .unwrap()
                 .ends_with("agentboard-hook.exe")
         );
+        // v0.1.3：PermissionRequest / Stop 各一组；官方文档——两组均不带 matcher
+        //（PermissionRequest 省略 matcher = 所有工具触发；Stop 完全不支持 matcher）
+        let pr = &v["hooks"]["PermissionRequest"][0];
+        assert!(
+            pr.get("matcher").is_none(),
+            "PermissionRequest 组无 matcher 字段"
+        );
+        assert_eq!(pr["hooks"][0]["type"], "command");
+        assert!(
+            pr["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("agentboard-hook.exe")
+        );
+        let stop = &v["hooks"]["Stop"][0];
+        assert!(stop.get("matcher").is_none(), "Stop 组无 matcher 字段");
+        assert!(
+            stop["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("agentboard-hook.exe")
+        );
         // hook exe 被复制到备份根同级的 bin 目录约定位置由调用方定；此处只验证注册串里是传入的 exe 路径
     }
 
@@ -208,7 +269,13 @@ mod tests {
         assert!(!report.changed, "重复安装无变更");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(v["hooks"]["Notification"].as_array().unwrap().len(), 1);
+        for event in ["Notification", "PermissionRequest", "Stop"] {
+            assert_eq!(
+                v["hooks"][event].as_array().unwrap().len(),
+                1,
+                "{event} 组不重复"
+            );
+        }
     }
 
     #[test]
@@ -218,19 +285,48 @@ mod tests {
         let backup_root = t.0.join("backups");
         install_hooks(&exe, &settings, &backup_root).unwrap();
         let removed = uninstall_hooks(&settings).unwrap();
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 3, "三组各删一个");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert!(
-            v["hooks"]["Notification"]
-                .as_array()
-                .map(|a| a.is_empty())
-                .unwrap_or(true)
-        );
+        for event in ["Notification", "PermissionRequest", "Stop"] {
+            assert!(
+                v["hooks"][event]
+                    .as_array()
+                    .map(|a| a.is_empty())
+                    .unwrap_or(true)
+            );
+        }
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["matcher"], "Bash",
             "别人的 hook 不能动"
         );
+    }
+
+    // 旧版本（v0.1.2 及以前）settings 只有 Notification 单组：升级补装 PermissionRequest/Stop，
+    // Notification 不重复。
+    #[test]
+    fn upgrades_legacy_single_group_file() {
+        let t = tmp("upgrade");
+        let (exe, settings) = exe_and_settings(&t.0);
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"Notification":[{"matcher":"permission_prompt|idle_prompt|agent_needs_input","hooks":[{"type":"command","command":"C:\\old\\agentboard-hook.exe","args":["notification"]}]}]}}"#,
+        )
+        .unwrap();
+        let report = install_hooks(&exe, &settings, &t.0.join("backups")).unwrap();
+        assert!(report.changed);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["Notification"].as_array().unwrap().len(),
+            1,
+            "既有 Notification 组不重复补装"
+        );
+        assert_eq!(v["hooks"]["PermissionRequest"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
+        // 再装一次收敛为幂等
+        let report = install_hooks(&exe, &settings, &t.0.join("backups")).unwrap();
+        assert!(!report.changed);
     }
 
     #[test]
@@ -246,7 +342,9 @@ mod tests {
         );
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert!(v["hooks"]["Notification"].as_array().unwrap().len() == 1);
+        for event in ["Notification", "PermissionRequest", "Stop"] {
+            assert_eq!(v["hooks"][event].as_array().unwrap().len(), 1);
+        }
     }
 
     #[test]
