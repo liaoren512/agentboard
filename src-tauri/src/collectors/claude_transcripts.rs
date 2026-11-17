@@ -8,7 +8,9 @@ use crate::core::types::*;
 pub(crate) mod tempdir_guard {
     pub struct TempDir(pub std::path::PathBuf);
     impl Drop for TempDir {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -21,17 +23,27 @@ pub struct TranscriptPoller {
 
 impl TranscriptPoller {
     pub fn new(root: PathBuf) -> Self {
-        Self { root, offsets: HashMap::new(), known: HashSet::new() }
+        Self {
+            root,
+            offsets: HashMap::new(),
+            known: HashSet::new(),
+        }
     }
 
     pub fn poll(&mut self, now: u64) -> Vec<UnifiedEvent> {
         let mut events = Vec::new();
-        let Ok(entries) = std::fs::read_dir(&self.root) else { return events };
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return events;
+        };
         for proj in entries.flatten() {
-            let Ok(files) = std::fs::read_dir(proj.path()) else { continue };
+            let Ok(files) = std::fs::read_dir(proj.path()) else {
+                continue;
+            };
             for file in files.flatten() {
                 let path = file.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
                 self.poll_file(&path, now, &mut events);
             }
         }
@@ -39,9 +51,13 @@ impl TranscriptPoller {
     }
 
     fn poll_file(&mut self, path: &Path, now: u64, events: &mut Vec<UnifiedEvent>) {
-        let Ok(data) = std::fs::read(path) else { return };
+        let Ok(data) = std::fs::read(path) else {
+            return;
+        };
         let start = *self.offsets.entry(path.to_path_buf()).or_insert(0);
-        if (data.len() as u64) <= start { return; }
+        if (data.len() as u64) <= start {
+            return;
+        }
         let fresh = &data[start as usize..];
         let mut consumed = 0u64;
         let mut discovered = false;
@@ -54,12 +70,26 @@ impl TranscriptPoller {
         while let Some(line) = lines.next() {
             // 只消费完整行：本段后面还有分隔符(\n)才算 len+1；末尾空段/半行不计，留待下次 poll
             let complete = lines.peek().is_some();
-            if complete { consumed += line.len() as u64 + 1; }
-            let Ok(text) = std::str::from_utf8(line) else { continue };
-            if text.trim().is_empty() { continue; }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { continue };
-            let sid = v.get("sessionId").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            if sid.is_empty() { continue; }
+            if complete {
+                consumed += line.len() as u64 + 1;
+            }
+            let Ok(text) = std::str::from_utf8(line) else {
+                continue;
+            };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            let sid = v
+                .get("sessionId")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if sid.is_empty() {
+                continue;
+            }
             session_id = Some(sid.clone());
             if cwd.is_none() {
                 cwd = v.get("cwd").and_then(|x| x.as_str()).map(|s| s.to_string());
@@ -84,16 +114,26 @@ impl TranscriptPoller {
         }
         if discovered {
             events.push(UnifiedEvent::Discovered {
-                agent, session_id: sid.clone(),
+                agent,
+                session_id: sid.clone(),
                 cwd: cwd.unwrap_or_default(),
-                title, ts: now,
+                title,
+                ts: now,
             });
         }
         if activity {
-            events.push(UnifiedEvent::Activity { agent, session_id: sid.clone(), ts: now });
+            events.push(UnifiedEvent::Activity {
+                agent,
+                session_id: sid.clone(),
+                ts: now,
+            });
         }
         if failed {
-            events.push(UnifiedEvent::TurnFailed { agent, session_id: sid, ts: now });
+            events.push(UnifiedEvent::TurnFailed {
+                agent,
+                session_id: sid,
+                ts: now,
+            });
         }
     }
 }
@@ -103,7 +143,9 @@ fn extract_user_text(v: &serde_json::Value) -> Option<String> {
     match msg.get("content") {
         Some(serde_json::Value::String(s)) => Some(s.clone()),
         Some(serde_json::Value::Array(a)) => a.iter().find_map(|c| {
-            c.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+            c.get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
         }),
         _ => None,
     }
@@ -131,7 +173,9 @@ mod tests {
         let mut p = TranscriptPoller::new(_g.0.clone());
         let ev = p.poll(1000);
         assert!(ev.iter().any(|e| matches!(e, UnifiedEvent::Discovered { session_id, title: Some(t), .. } if session_id == "s-1" && t.contains("修复登录"))));
-        assert!(ev.iter().any(|e| matches!(e, UnifiedEvent::Activity { session_id, .. } if session_id == "s-1")));
+        assert!(ev.iter().any(
+            |e| matches!(e, UnifiedEvent::Activity { session_id, .. } if session_id == "s-1")
+        ));
     }
 
     #[test]
@@ -145,8 +189,14 @@ mod tests {
         let err_line = r#"{"type":"assistant","sessionId":"s-1","isApiErrorMessage":true,"message":{"content":"API Error: 500"}}"#;
         std::fs::write(&f, format!("{FIRST_LINE}\n{err_line}\n")).unwrap();
         let ev = p.poll(2000);
-        assert!(ev.iter().any(|e| matches!(e, UnifiedEvent::Activity { .. })));
-        assert!(ev.iter().any(|e| matches!(e, UnifiedEvent::TurnFailed { .. })));
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, UnifiedEvent::Activity { .. }))
+        );
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, UnifiedEvent::TurnFailed { .. }))
+        );
     }
 
     #[test]
@@ -157,10 +207,21 @@ mod tests {
         let mut p = TranscriptPoller::new(_g.0.clone());
         let ev = p.poll(1000);
         // 半行不能产生第二个事件（第一个完整行已产生 Discovered）
-        assert_eq!(ev.iter().filter(|e| matches!(e, UnifiedEvent::Activity { .. })).count(), 1);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, UnifiedEvent::Activity { .. }))
+                .count(),
+            1
+        );
         // 补全后半行 → 下次 poll 产出 Activity
-        std::fs::write(&f, format!("{FIRST_LINE}\n{{\"type\":\"assistant\",\"sessionId\":\"s-2\"}}\n")).unwrap();
+        std::fs::write(
+            &f,
+            format!("{FIRST_LINE}\n{{\"type\":\"assistant\",\"sessionId\":\"s-2\"}}\n"),
+        )
+        .unwrap();
         let ev = p.poll(2000);
-        assert!(ev.iter().any(|e| matches!(e, UnifiedEvent::Activity { session_id, .. } if session_id == "s-2")));
+        assert!(ev.iter().any(
+            |e| matches!(e, UnifiedEvent::Activity { session_id, .. } if session_id == "s-2")
+        ));
     }
 }

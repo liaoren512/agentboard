@@ -1,6 +1,6 @@
 // src-tauri/src/collectors/claude_events.rs
-use std::path::PathBuf;
 use crate::core::types::*;
+use std::path::PathBuf;
 
 pub struct HookEventsPoller {
     file: PathBuf,
@@ -8,14 +8,20 @@ pub struct HookEventsPoller {
 }
 
 impl HookEventsPoller {
-    pub fn new(file: PathBuf) -> Self { Self { file, offset: 0 } }
+    pub fn new(file: PathBuf) -> Self {
+        Self { file, offset: 0 }
+    }
 
     pub fn poll(&mut self) -> Vec<UnifiedEvent> {
         let mut out = Vec::new();
-        let Ok(data) = std::fs::read(&self.file) else { return out };
+        let Ok(data) = std::fs::read(&self.file) else {
+            return out;
+        };
         // 轮转/截断（Task 5 轮转 = rename 旧文件 + 新建空文件）：offset 超过新文件长度
         // 时从头读，首次 poll 必命中归零分支，轮转前后事件无缺口。
-        if (self.offset as usize) > data.len() { self.offset = 0; }
+        if (self.offset as usize) > data.len() {
+            self.offset = 0;
+        }
         let start = self.offset as usize;
         let fresh = &data[start..];
         // 只消费到最后一个换行（含）：无换行尾的最后一段是半行，留待下次补全后整行消费。
@@ -26,10 +32,18 @@ impl HookEventsPoller {
             None => start,
         };
         for line in data[start..end].split(|b| *b == b'\n') {
-            let Ok(text) = std::str::from_utf8(line) else { continue };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else { continue };
-            let Some(session_id) = v.get("sessionId").and_then(|x| x.as_str()) else { continue };
-            let Some(ts) = v.get("ts").and_then(|x| x.as_u64()) else { continue };
+            let Ok(text) = std::str::from_utf8(line) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            let Some(session_id) = v.get("sessionId").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let Some(ts) = v.get("ts").and_then(|x| x.as_u64()) else {
+                continue;
+            };
             let kind = match v.get("kind").and_then(|x| x.as_str()).unwrap_or("") {
                 "permission_prompt" => WaitingKind::Permission,
                 "idle_prompt" => WaitingKind::Idle,
@@ -38,7 +52,8 @@ impl HookEventsPoller {
             out.push(UnifiedEvent::Waiting {
                 agent: AgentKind::ClaudeCode,
                 session_id: session_id.to_string(),
-                kind, ts,
+                kind,
+                ts,
             });
         }
         self.offset = end as u64;
@@ -61,7 +76,14 @@ mod tests {
         let line = r#"{"agent":"claude-code","sessionId":"s1","cwd":"C:\\w","kind":"permission_prompt","message":"needs permission","ts":123}"#;
         std::fs::write(&f, format!("{line}\n")).unwrap();
         let ev = p.poll();
-        assert!(matches!(&ev[..], [UnifiedEvent::Waiting { kind: WaitingKind::Permission, ts: 123, .. }]));
+        assert!(matches!(
+            &ev[..],
+            [UnifiedEvent::Waiting {
+                kind: WaitingKind::Permission,
+                ts: 123,
+                ..
+            }]
+        ));
 
         // 同一行不重复消费
         assert!(p.poll().is_empty());
@@ -75,8 +97,22 @@ mod tests {
         let mut p = HookEventsPoller::new(f.clone());
         let ev = p.poll();
         assert_eq!(ev.len(), 2);
-        assert!(matches!(&ev[0], UnifiedEvent::Waiting { kind: WaitingKind::Idle, ts: 9, .. }));
-        assert!(matches!(&ev[1], UnifiedEvent::Waiting { kind: WaitingKind::Other, ts: 10, .. }));
+        assert!(matches!(
+            &ev[0],
+            UnifiedEvent::Waiting {
+                kind: WaitingKind::Idle,
+                ts: 9,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &ev[1],
+            UnifiedEvent::Waiting {
+                kind: WaitingKind::Other,
+                ts: 10,
+                ..
+            }
+        ));
         std::fs::remove_file(&f).unwrap();
     }
 
@@ -93,7 +129,14 @@ mod tests {
         std::fs::write(&f, format!("{line}\n")).unwrap();
         let ev = p.poll();
         assert_eq!(ev.len(), 1);
-        assert!(matches!(&ev[0], UnifiedEvent::Waiting { kind: WaitingKind::Permission, ts: 7, .. }));
+        assert!(matches!(
+            &ev[0],
+            UnifiedEvent::Waiting {
+                kind: WaitingKind::Permission,
+                ts: 7,
+                ..
+            }
+        ));
         std::fs::remove_file(&f).unwrap();
     }
 }

@@ -9,8 +9,10 @@ fn run() -> std::io::Result<()> {
     use std::io::Read;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
-    let ts = agentboard_scaffold_lib::events_file_now_ms();
-    let Some(line) = agentboard_scaffold_lib::events_file_handle_input(&input, ts) else { return Ok(()) };
-    let dir = agentboard_scaffold_lib::agentboard_dir().join("events");
-    agentboard_scaffold_lib::events_file_append_event(&line, &dir)
+    let ts = agentboard::events_file_now_ms();
+    let Some(line) = agentboard::events_file_handle_input(&input, ts) else {
+        return Ok(());
+    };
+    let dir = agentboard::agentboard_dir().join("events");
+    agentboard::events_file_append_event(&line, &dir)
 }

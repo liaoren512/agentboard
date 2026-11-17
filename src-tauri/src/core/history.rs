@@ -1,10 +1,14 @@
 use crate::core::types::*;
 
-pub struct History { con: rusqlite::Connection }
+pub struct History {
+    con: rusqlite::Connection,
+}
 
 impl History {
     pub fn open(path: &std::path::Path) -> rusqlite::Result<Self> {
-        if let Some(p) = path.parent() { std::fs::create_dir_all(p).ok(); }
+        if let Some(p) = path.parent() {
+            std::fs::create_dir_all(p).ok();
+        }
         let con = rusqlite::Connection::open(path)?;
         Self::with_connection(con)
     }
@@ -41,8 +45,12 @@ impl History {
             Ok(SessionSnapshot {
                 session_id: r.get(0)?,
                 agent: serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or(AgentKind::ZCode),
-                title: r.get(2)?, cwd: r.get(3)?, repo: r.get(4)?, branch: r.get(5)?,
-                status: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or(SessionStatus::Done),
+                title: r.get(2)?,
+                cwd: r.get(3)?,
+                repo: r.get(4)?,
+                branch: r.get(5)?,
+                status: serde_json::from_str(&r.get::<_, String>(6)?)
+                    .unwrap_or(SessionStatus::Done),
                 done_inferred: r.get::<_, i64>(7)? != 0,
                 last_activity: r.get::<_, i64>(8)? as u64,
                 time_created: r.get::<_, i64>(9)? as u64,
@@ -54,7 +62,9 @@ impl History {
     pub fn prune(&self, keep: usize) -> rusqlite::Result<()> {
         self.con.execute(
             "DELETE FROM sessions WHERE session_id NOT IN (
-                SELECT session_id FROM sessions ORDER BY last_activity DESC LIMIT ?1)", (keep as i64,))?;
+                SELECT session_id FROM sessions ORDER BY last_activity DESC LIMIT ?1)",
+            (keep as i64,),
+        )?;
         Ok(())
     }
 }
@@ -65,10 +75,16 @@ mod tests {
 
     fn snap(id: &str, activity: u64) -> SessionSnapshot {
         SessionSnapshot {
-            session_id: id.into(), agent: AgentKind::ZCode, title: "t".into(),
-            cwd: r"C:\repo\z".into(), repo: "z".into(), branch: None,
-            status: SessionStatus::Done, done_inferred: false,
-            last_activity: activity, time_created: activity,
+            session_id: id.into(),
+            agent: AgentKind::ZCode,
+            title: "t".into(),
+            cwd: r"C:\repo\z".into(),
+            repo: "z".into(),
+            branch: None,
+            status: SessionStatus::Done,
+            done_inferred: false,
+            last_activity: activity,
+            time_created: activity,
         }
     }
 
@@ -84,7 +100,9 @@ mod tests {
         assert_eq!(list[0].session_id, "a");
         assert_eq!(list[0].last_activity, 9);
 
-        for i in 0..1100u64 { h.upsert(&snap(&format!("x{i}"), 100 + i)).unwrap(); }
+        for i in 0..1100u64 {
+            h.upsert(&snap(&format!("x{i}"), 100 + i)).unwrap();
+        }
         h.prune(1000).unwrap();
         assert_eq!(h.list().unwrap().len(), 1000);
     }

@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionSnapshot } from "./types";
 
@@ -30,28 +31,36 @@ function formatRelative(ts: number): string {
 }
 
 export default function SessionRow({ session }: { session: SessionSnapshot }) {
+  const [note, setNote] = useState<string | null>(null);
+  const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
   const jump = () => {
-    try {
-      invoke("jump", { sessionId: session.sessionId }).catch((e) => console.warn("jump failed:", e));
-    } catch (e) {
-      console.warn("jump failed:", e);
-    }
+    invoke<string>("jump", { sessionId: session.sessionId })
+      .then((n) => {
+        setNote(n);
+        window.clearTimeout(timer.current);
+        timer.current = window.setTimeout(() => setNote(null), 2500);
+      })
+      .catch((e) => console.warn("jump failed:", e));
   };
   return (
-    <div className="row" onClick={jump}>
-      <span className={`agent-badge agent-${session.agent}`}>{AGENT_LABEL[session.agent]}</span>
-      <span className="title" title={session.title}>{session.title}</span>
-      <span className="meta">
-        {session.repo}
-        {session.branch ? ` · ${session.branch}` : ""}
-      </span>
-      <span className="time">{formatRelative(session.lastActivity)}</span>
-      <span className={`status-badge status-${statusClass(session.status)}`}>
-        {STATUS_LABEL[session.status]}
-      </span>
-      {session.status === "done" && session.doneInferred && (
-        <span className="inferred-badge" title="由静默推断完成">推断</span>
-      )}
-    </div>
+    <>
+      <div className="row" onClick={jump}>
+        <span className={`agent-badge agent-${session.agent}`}>{AGENT_LABEL[session.agent]}</span>
+        <span className="title" title={session.title}>{session.title}</span>
+        <span className="meta">
+          {session.repo}
+          {session.branch ? ` · ${session.branch}` : ""}
+        </span>
+        <span className="time">{formatRelative(session.lastActivity)}</span>
+        <span className={`status-badge status-${statusClass(session.status)}`}>
+          {STATUS_LABEL[session.status]}
+        </span>
+        {session.status === "done" && session.doneInferred && (
+          <span className="inferred-badge" title="由静默推断完成">推断</span>
+        )}
+      </div>
+      {note && <div className="jump-note">{note}</div>}
+    </>
   );
 }

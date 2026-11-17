@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "agentboard-scaffold",
+  "productName": "agentboard",
   "version": "0.1.0",
-  "identifier": "com.tauri-app.agentboard-scaffold",
+  "identifier": "com.agentboard.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "agentboard-scaffold",
+        "title": "agentboard",
         "width": 800,
         "height": 600
       }

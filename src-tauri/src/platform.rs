@@ -27,9 +27,16 @@ mod tests {
 
     fn snap(agent: AgentKind, id: &str, cwd: &str) -> SessionSnapshot {
         SessionSnapshot {
-            session_id: id.into(), agent, title: "t".into(), cwd: cwd.into(),
-            repo: "r".into(), branch: None, status: SessionStatus::Done,
-            done_inferred: false, last_activity: 0, time_created: 0,
+            session_id: id.into(),
+            agent,
+            title: "t".into(),
+            cwd: cwd.into(),
+            repo: "r".into(),
+            branch: None,
+            status: SessionStatus::Done,
+            done_inferred: false,
+            last_activity: 0,
+            time_created: 0,
         }
     }
 

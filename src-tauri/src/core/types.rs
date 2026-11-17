@@ -104,13 +104,42 @@ pub struct SessionSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UnifiedEvent {
-    Discovered { agent: AgentKind, session_id: String, cwd: String, title: Option<String>, ts: u64 },
-    Activity { agent: AgentKind, session_id: String, ts: u64 },
-    Waiting { agent: AgentKind, session_id: String, kind: WaitingKind, ts: u64 },
-    TurnFailed { agent: AgentKind, session_id: String, ts: u64 },
-    TurnFinished { agent: AgentKind, session_id: String, ts: u64 },
-    Closed { agent: AgentKind, session_id: String, ts: u64 },
-    Tick { now: u64 },
+    Discovered {
+        agent: AgentKind,
+        session_id: String,
+        cwd: String,
+        title: Option<String>,
+        ts: u64,
+    },
+    Activity {
+        agent: AgentKind,
+        session_id: String,
+        ts: u64,
+    },
+    Waiting {
+        agent: AgentKind,
+        session_id: String,
+        kind: WaitingKind,
+        ts: u64,
+    },
+    TurnFailed {
+        agent: AgentKind,
+        session_id: String,
+        ts: u64,
+    },
+    TurnFinished {
+        agent: AgentKind,
+        session_id: String,
+        ts: u64,
+    },
+    Closed {
+        agent: AgentKind,
+        session_id: String,
+        ts: u64,
+    },
+    Tick {
+        now: u64,
+    },
 }
 
 pub fn repo_name(cwd: &str) -> String {
@@ -126,7 +155,8 @@ pub fn branch_from_git(cwd: &str) -> Option<String> {
     let head = std::path::Path::new(cwd).join(".git").join("HEAD");
     let text = std::fs::read_to_string(head).ok()?;
     let line = text.lines().next()?;
-    line.strip_prefix("ref: refs/heads/").map(|s| s.trim().to_string())
+    line.strip_prefix("ref: refs/heads/")
+        .map(|s| s.trim().to_string())
 }
 
 pub fn now_ms() -> u64 {
@@ -162,7 +192,10 @@ mod tests {
 
     #[test]
     fn repo_name_takes_last_segment() {
-        assert_eq!(repo_name(r"C:\Apps\lr\workspace_ai\agentboard"), "agentboard");
+        assert_eq!(
+            repo_name(r"C:\Apps\lr\workspace_ai\agentboard"),
+            "agentboard"
+        );
     }
 
     #[test]
@@ -171,6 +204,9 @@ mod tests {
         let git = dir.join(".git");
         std::fs::create_dir_all(&git).unwrap();
         std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        assert_eq!(branch_from_git(dir.to_str().unwrap()), Some("main".to_string()));
+        assert_eq!(
+            branch_from_git(dir.to_str().unwrap()),
+            Some("main".to_string())
+        );
     }
 }
