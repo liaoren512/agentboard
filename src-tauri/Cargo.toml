@@ -38,9 +38,9 @@ path = "src/hook_main.rs"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+# 不设 panic = "abort"：spawn_guarded 的 catch_unwind 守卫依赖 unwind 才能在 release 生效
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
 strip = true

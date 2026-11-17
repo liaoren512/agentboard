@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 const MARKER: &str = "agentboard-hook.exe";
 const MATCHER: &str = "permission_prompt|idle_prompt|agent_needs_input";
 
+#[derive(Debug)]
 pub struct InstallReport {
     pub backup_path: PathBuf,
     pub changed: bool,
@@ -20,6 +21,13 @@ pub fn install_hooks(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
 
+    if !root.is_object() {
+        // 顶层不是对象（如数组/字符串）没法安全合并：报错不 panic，原文件不动
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "settings.json 顶层不是 JSON 对象",
+        ));
+    }
     if group_present(&root) {
         return Ok(InstallReport {
             backup_path: PathBuf::new(),
@@ -30,29 +38,40 @@ pub fn install_hooks(
     // 1) 备份（仅在确要修改前）
     let ts = crate::core::types::now_ms();
     let backup_dir = backup_root.join(format!("{ts}"));
+    let mut backup_path = PathBuf::new();
     if settings_path.exists() {
         std::fs::create_dir_all(&backup_dir)?;
         std::fs::copy(settings_path, backup_dir.join("settings.json"))?;
+        backup_path = backup_dir.join("settings.json");
     }
 
-    // 2) 合并
-    let hooks = root
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-    let notification = hooks
-        .as_object_mut()
-        .unwrap()
+    // 2) 合并（hooks / Notification 类型不对同样报错不 panic；此时已备份，原文件仍未动）
+    let Some(obj) = root.as_object_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "settings.json 顶层不是 JSON 对象",
+        ));
+    };
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    let Some(hooks_obj) = hooks.as_object_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "settings.json 的 hooks 字段不是 JSON 对象",
+        ));
+    };
+    let notification = hooks_obj
         .entry("Notification")
         .or_insert_with(|| serde_json::json!([]));
-    notification
-        .as_array_mut()
-        .unwrap()
-        .push(serde_json::json!({
-            "matcher": MATCHER,
-            "hooks": [{ "type": "command", "command": exe_str, "args": ["notification"] }]
-        }));
+    let Some(groups) = notification.as_array_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "settings.json 的 hooks.Notification 不是 JSON 数组",
+        ));
+    };
+    groups.push(serde_json::json!({
+        "matcher": MATCHER,
+        "hooks": [{ "type": "command", "command": exe_str, "args": ["notification"] }]
+    }));
 
     // 3) 写回（pretty，UTF-8）
     if let Some(parent) = settings_path.parent() {
@@ -61,7 +80,7 @@ pub fn install_hooks(
     std::fs::write(settings_path, serde_json::to_string_pretty(&root).unwrap())?;
     prune_backups(backup_root, 10);
     Ok(InstallReport {
-        backup_path: backup_dir.join("settings.json"),
+        backup_path,
         changed: true,
     })
 }
@@ -221,8 +240,27 @@ mod tests {
         std::fs::remove_file(&settings).unwrap();
         let report = install_hooks(&exe, &settings, &t.0.join("backups")).unwrap();
         assert!(report.changed);
+        assert!(
+            report.backup_path.as_os_str().is_empty(),
+            "缺文件新装无备份，backup_path 应为空"
+        );
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert!(v["hooks"]["Notification"].as_array().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn install_rejects_non_object_settings_and_leaves_file_untouched() {
+        let t = tmp("non_object");
+        let (exe, settings) = exe_and_settings(&t.0);
+        std::fs::write(&settings, "[1,2,3]").unwrap();
+        let before = std::fs::read_to_string(&settings).unwrap();
+        let err = install_hooks(&exe, &settings, &t.0.join("backups")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            before,
+            "报错路径原文件不动"
+        );
     }
 }

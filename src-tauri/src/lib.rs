@@ -9,7 +9,7 @@ use crate::core::machine::Machine;
 use crate::core::types::*;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
@@ -18,6 +18,15 @@ use tauri_plugin_notification::NotificationExt;
 /// config 的两个阈值（running_fresh_ms / done_after_ms）v1 预留未接线，Machine 固定用 15 分钟完成推断阈值。
 const DEFAULT_DONE_AFTER_MS: u64 = 15 * 60 * 1000;
 const TRAY_ID: &str = "agentboard-tray";
+
+/// 应用启动时刻（epoch ms，run() 里记一次）。启动首扫会把历史数据当事件回放，
+/// 由此推导的状态迁移（如历史会话推断完成）一律静默，防止启动通知风暴。
+static APP_START_MS: OnceLock<u64> = OnceLock::new();
+
+/// 通知闸（纯函数，便于单测）：last_activity 早于应用启动时刻 → 历史回填，不发通知。
+fn notification_allowed(last_activity: u64, app_start_ms: u64) -> bool {
+    last_activity >= app_start_ms
+}
 
 pub fn agentboard_dir() -> PathBuf {
     dirs::home_dir()
@@ -166,7 +175,7 @@ fn spawn_transcript_watcher(tx: mpsc::Sender<UnifiedEvent>) {
         };
         let root = claude_projects_dir();
         let mut poller = collectors::claude_transcripts::TranscriptPoller::new(root.clone());
-        send_all(&tx, poller.poll(now_ms()));
+        send_all(&tx, poller.poll());
 
         let (sig_tx, sig_rx) = mpsc::channel::<()>();
         let debouncer = new_debouncer(
@@ -184,14 +193,14 @@ fn spawn_transcript_watcher(tx: mpsc::Sender<UnifiedEvent>) {
             if deb.watcher().watch(&root, RecursiveMode::Recursive).is_ok() {
                 // watch 建立成功：信号驱动
                 while sig_rx.recv().is_ok() {
-                    send_all(&tx, poller.poll(now_ms()));
+                    send_all(&tx, poller.poll());
                 }
                 return;
             }
         }
         // 兜底：debouncer/watch 失败 → 4s 轮询
         loop {
-            send_all(&tx, poller.poll(now_ms()));
+            send_all(&tx, poller.poll());
             std::thread::sleep(Duration::from_secs(4));
         }
     });
@@ -275,7 +284,11 @@ fn update_tray(app: &AppHandle, snaps: &[SessionSnapshot]) {
 }
 
 /// 通知：should_notify 即发，受设置页 notify_enabled 门控（每次通知读一次小 JSON，频率低可接受）；body 只放 repo。
+/// 另受启动回填闸门控：last_activity 早于 APP_START 的迁移不通知（看板显示不受影响）。
 fn send_notification(app: &AppHandle, snap: &SessionSnapshot) {
+    if !notification_allowed(snap.last_activity, *APP_START_MS.get_or_init(now_ms)) {
+        return;
+    }
     if !core::config::load().notify_enabled {
         return;
     }
@@ -363,6 +376,7 @@ fn spawn_core(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = APP_START_MS.set(now_ms()); // 启动时刻记一次：回填闸基准
     let (tx, rx) = mpsc::channel::<UnifiedEvent>();
     let machine = Arc::new(Mutex::new(Machine::new(DEFAULT_DONE_AFTER_MS)));
     let history = Arc::new(Mutex::new(
@@ -417,5 +431,71 @@ pub fn run() {
             install_hooks_cmd
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("error while running tauri application")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collectors::claude_transcripts::TranscriptPoller;
+
+    const DONE_AFTER: u64 = 15 * 60 * 1000;
+
+    #[test]
+    fn gate_blocks_only_backfill() {
+        let start = 1_000_000u64;
+        assert!(
+            !notification_allowed(start - 1, start),
+            "早于启动时刻 → 静默"
+        );
+        assert!(
+            notification_allowed(start, start),
+            "启动后的活动 → 允许通知"
+        );
+    }
+
+    /// 验收：历史转录（mtime 早于 15 分钟阈值）首扫 → 首个 Tick 推断 Done，
+    /// machine 层会请求通知，但经 APP_START 闸（last_activity < 启动时刻）后不通知。
+    #[test]
+    fn historical_transcript_first_scan_infers_done_silently() {
+        let base = std::env::temp_dir().join(format!("ab-lib-{}-hist", std::process::id()));
+        let proj = base.join("C--Apps-repo-x");
+        std::fs::create_dir_all(&proj).unwrap();
+        let now = 10_000_000_000_000u64;
+        let old_mtime = now - DONE_AFTER - 60_000; // 早于 15 分钟阈值的历史写入
+        std::fs::write(
+            proj.join("s-old.jsonl"),
+            r#"{"type":"user","sessionId":"s-old","cwd":"C:\\Apps\\repo\\x","message":{"content":"历史任务"}}"#,
+        )
+        .unwrap();
+
+        // 首扫（模拟启动回填）：事件 ts = 文件 mtime（旧）
+        let mut poller = TranscriptPoller::new(base.clone());
+        let events = poller.poll_with_ts(|_| old_mtime);
+        let _ = std::fs::remove_dir_all(&base);
+
+        let mut m = Machine::new(DONE_AFTER);
+        let mut ups = Vec::new();
+        for e in &events {
+            ups.extend(m.process(e));
+        }
+        assert!(
+            ups.iter().all(|u| u.snapshot.last_activity == old_mtime),
+            "首扫事件的时间戳来自 mtime 而非轮询时刻"
+        );
+
+        // 首个 Tick 即推断 Done（不再显示 15 分钟错误的"运行中"）
+        let ups = m.process(&UnifiedEvent::Tick { now });
+        assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0].snapshot.status, SessionStatus::Done);
+        assert!(ups[0].snapshot.done_inferred);
+        assert!(ups[0].should_notify, "machine 层不知道启动时刻，会请求通知");
+
+        // 但经 APP_START 闸后不发通知（历史回填一律静默）
+        let app_start = now;
+        assert!(!notification_allowed(
+            ups[0].snapshot.last_activity,
+            app_start
+        ));
+    }
 }

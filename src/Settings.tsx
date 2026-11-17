@@ -56,7 +56,9 @@ export default function Settings({ onBack }: { onBack: () => void }) {
       .then((r) =>
         setInstallMsg(
           r.changed
-            ? `已写入 hook，备份：${r.backupPath}`
+            ? r.backupPath
+              ? `已写入 hook，备份：${r.backupPath}`
+              : "已写入 hook（新文件，无备份）"
             : "hook 已注册过，无需重复接入",
         ),
       )

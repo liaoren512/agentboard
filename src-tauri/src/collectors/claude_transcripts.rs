@@ -30,7 +30,14 @@ impl TranscriptPoller {
         }
     }
 
-    pub fn poll(&mut self, now: u64) -> Vec<UnifiedEvent> {
+    /// 生产路径：事件 ts 用转录文件的 mtime（而非轮询时刻）——启动首扫历史文件时
+    /// last_activity 是真实最后写入时间，首个 Tick 即可推断完成，不会伪装成"刚刚活跃"。
+    pub fn poll(&mut self) -> Vec<UnifiedEvent> {
+        self.poll_with_ts(file_mtime_ms)
+    }
+
+    /// ts 来源可注入（测试用）：生产传 file_mtime_ms。
+    pub fn poll_with_ts(&mut self, mtime: impl Fn(&Path) -> u64) -> Vec<UnifiedEvent> {
         let mut events = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return events;
@@ -44,13 +51,14 @@ impl TranscriptPoller {
                 if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                     continue;
                 }
-                self.poll_file(&path, now, &mut events);
+                let ts = mtime(&path);
+                self.poll_file(&path, ts, &mut events);
             }
         }
         events
     }
 
-    fn poll_file(&mut self, path: &Path, now: u64, events: &mut Vec<UnifiedEvent>) {
+    fn poll_file(&mut self, path: &Path, ts: u64, events: &mut Vec<UnifiedEvent>) {
         let Ok(data) = std::fs::read(path) else {
             return;
         };
@@ -118,24 +126,34 @@ impl TranscriptPoller {
                 session_id: sid.clone(),
                 cwd: cwd.unwrap_or_default(),
                 title,
-                ts: now,
+                ts,
             });
         }
         if activity {
             events.push(UnifiedEvent::Activity {
                 agent,
                 session_id: sid.clone(),
-                ts: now,
+                ts,
             });
         }
         if failed {
             events.push(UnifiedEvent::TurnFailed {
                 agent,
                 session_id: sid,
-                ts: now,
+                ts,
             });
         }
     }
+}
+
+/// 文件 mtime → epoch ms；取不到（刚被删/不可读）回退当前时刻，视为活跃。
+pub fn file_mtime_ms(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_else(crate::core::types::now_ms)
 }
 
 fn extract_user_text(v: &serde_json::Value) -> Option<String> {
@@ -171,7 +189,7 @@ mod tests {
         let (_g, proj) = fixture_dir("discover");
         std::fs::write(proj.join("s-1.jsonl"), format!("{FIRST_LINE}\n")).unwrap();
         let mut p = TranscriptPoller::new(_g.0.clone());
-        let ev = p.poll(1000);
+        let ev = p.poll();
         assert!(ev.iter().any(|e| matches!(e, UnifiedEvent::Discovered { session_id, title: Some(t), .. } if session_id == "s-1" && t.contains("修复登录"))));
         assert!(ev.iter().any(
             |e| matches!(e, UnifiedEvent::Activity { session_id, .. } if session_id == "s-1")
@@ -184,11 +202,11 @@ mod tests {
         let f = proj.join("s-1.jsonl");
         std::fs::write(&f, format!("{FIRST_LINE}\n")).unwrap();
         let mut p = TranscriptPoller::new(_g.0.clone());
-        p.poll(1000);
+        p.poll();
 
         let err_line = r#"{"type":"assistant","sessionId":"s-1","isApiErrorMessage":true,"message":{"content":"API Error: 500"}}"#;
         std::fs::write(&f, format!("{FIRST_LINE}\n{err_line}\n")).unwrap();
-        let ev = p.poll(2000);
+        let ev = p.poll();
         assert!(
             ev.iter()
                 .any(|e| matches!(e, UnifiedEvent::Activity { .. }))
@@ -205,7 +223,7 @@ mod tests {
         let f = proj.join("s-2.jsonl");
         std::fs::write(&f, format!("{FIRST_LINE}\n{{\"type\":\"assi")).unwrap(); // 半行
         let mut p = TranscriptPoller::new(_g.0.clone());
-        let ev = p.poll(1000);
+        let ev = p.poll();
         // 半行不能产生第二个事件（第一个完整行已产生 Discovered）
         assert_eq!(
             ev.iter()
@@ -219,7 +237,7 @@ mod tests {
             format!("{FIRST_LINE}\n{{\"type\":\"assistant\",\"sessionId\":\"s-2\"}}\n"),
         )
         .unwrap();
-        let ev = p.poll(2000);
+        let ev = p.poll();
         assert!(ev.iter().any(
             |e| matches!(e, UnifiedEvent::Activity { session_id, .. } if session_id == "s-2")
         ));
