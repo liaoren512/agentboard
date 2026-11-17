@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2024"
+# 两个二进制（主程序 + agentboard-hook）时 tauri build 需要知道主二进制
+default-run = "agentboard-scaffold"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

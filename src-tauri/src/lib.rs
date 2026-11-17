@@ -2,6 +2,7 @@ pub mod collectors;
 pub mod core;
 pub mod events_file;
 pub mod installer;
+pub mod platform;
 
 use crate::core::history::History;
 use crate::core::machine::Machine;
@@ -50,6 +51,42 @@ fn get_source_status() -> serde_json::Value {
         "claude_transcripts": claude_projects_dir().exists(),
         "zcode_db": zcode_db_path().exists(),
     })
+}
+
+// R1 裁定：hook exe 与主程序同目录（dev=target/debug，安装=安装目录）。
+#[tauri::command]
+fn jump(app: tauri::AppHandle, state: tauri::State<AppState>, session_id: String) -> Result<String, String> {
+    let snap = state.machine.lock().unwrap_or_else(|p| p.into_inner()).snapshots()
+        .into_iter().find(|s| s.session_id == session_id)
+        .ok_or("会话不存在")?;
+    let p = platform::jump_payload(&snap);
+    if let Some((prog, args)) = &p.spawn {
+        std::process::Command::new(prog).args(args).spawn().map_err(|e| e.to_string())?;
+    }
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    app.clipboard().write_text(p.clipboard).map_err(|e| e.to_string())?;
+    Ok(p.note.to_string())
+}
+
+#[tauri::command]
+fn get_config() -> core::config::Config { core::config::load() }
+
+#[tauri::command]
+fn set_config(cfg: core::config::Config) -> Result<(), String> { core::config::save(&cfg).map_err(|e| e.to_string()) }
+
+#[tauri::command]
+fn install_hooks_cmd() -> Result<serde_json::Value, String> {
+    let hook_exe = std::env::current_exe().map_err(|e| e.to_string())?
+        .parent().ok_or("无法定位安装目录")?.join("agentboard-hook.exe");
+    if !hook_exe.exists() {
+        return Err("未找到 agentboard-hook.exe，请先完整构建".into());
+    }
+    let report = installer::install_hooks(&hook_exe, &claude_settings_path(), &agentboard_dir().join("backups"))
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "backupPath": report.backup_path.to_string_lossy(),
+        "changed": report.changed,
+    }))
 }
 
 // ---------- 装配 ----------
@@ -217,7 +254,7 @@ fn spawn_core(app: AppHandle, rx: mpsc::Receiver<UnifiedEvent>, machine: Arc<Mut
 pub fn run() {
     let (tx, rx) = mpsc::channel::<UnifiedEvent>();
     let machine = Arc::new(Mutex::new(Machine::new(DEFAULT_DONE_AFTER_MS)));
-    let history = Arc::new(Mutex::new(match History::open(&agentboard_dir().join("history.db")) {
+        let history = Arc::new(Mutex::new(match History::open(&agentboard_dir().join("history.sqlite")) {
         Ok(h) => h,
         // 磁盘打不开就退化为内存历史，看板功能不受损
         Err(_) => History::with_connection(
@@ -255,7 +292,7 @@ pub fn run() {
             spawn_core(app.handle().clone(), rx, machine.clone(), history.clone());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_sessions, get_source_status])
+        .invoke_handler(tauri::generate_handler![get_sessions, get_source_status, jump, get_config, set_config, install_hooks_cmd])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
