@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
-/// v1 无 config 门控（R8），Machine 固定用 15 分钟完成推断阈值。
+/// R8 的通知门控已在 send_notification 接线（读 notify_enabled）；
+/// config 的两个阈值（running_fresh_ms / done_after_ms）v1 预留未接线，Machine 固定用 15 分钟完成推断阈值。
 const DEFAULT_DONE_AFTER_MS: u64 = 15 * 60 * 1000;
 const TRAY_ID: &str = "agentboard-tray";
 
