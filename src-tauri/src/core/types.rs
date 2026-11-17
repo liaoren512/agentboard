@@ -4,6 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[serde(rename_all = "snake_case")]
 pub enum AgentKind {
     ClaudeCode,
+    // 显式指定：snake_case 会把 ZCode 拆成 "z_code"，与前端约定的 "zcode" 不符。
+    #[serde(rename = "zcode")]
     ZCode,
 }
 
@@ -169,6 +171,29 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 锁死 AgentKind 的 serde 字符串：必须与前端 types.ts 的
+    // "claude_code" | "zcode" 完全一致（教训：snake_case 曾把 ZCode 拆成 "z_code"）。
+    #[test]
+    fn agent_kind_serializes_to_frontend_strings() {
+        assert_eq!(
+            serde_json::to_string(&AgentKind::ZCode).unwrap(),
+            r#""zcode""#
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::ClaudeCode).unwrap(),
+            r#""claude_code""#
+        );
+    }
+
+    #[test]
+    fn agent_kind_serde_roundtrip() {
+        for kind in [AgentKind::ClaudeCode, AgentKind::ZCode] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: AgentKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, back);
+        }
+    }
 
     #[test]
     fn event_serde_roundtrip() {
