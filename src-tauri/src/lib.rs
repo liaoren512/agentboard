@@ -30,6 +30,29 @@ fn notification_allowed(last_activity: u64, app_start_ms: u64) -> bool {
     last_activity >= app_start_ms
 }
 
+/// 来源健康三态阈值：超过 10 分钟无数据 → 需要检查。
+const SOURCE_STALE_MS: u64 = 10 * 60 * 1000;
+
+/// 来源健康三态（纯函数，便于单测；前端 Settings 同规则换算）：
+/// None → "none"（未接入）/ 距今 <10 分钟 → "ok"（正常）/ 否则 → "stale"（需要检查）。
+fn health_state(last_event_at: Option<u64>, now: u64) -> &'static str {
+    match last_event_at {
+        None => "none",
+        Some(t) if now.saturating_sub(t) < SOURCE_STALE_MS => "ok",
+        Some(_) => "stale",
+    }
+}
+
+/// 各来源"最后一次有新数据"的时刻（epoch ms）。采集线程每次 poll 有新数据时更新，
+/// get_source_status 读取后换算三态。
+#[derive(Default)]
+struct SourceHealth {
+    claude_transcripts_last: Option<u64>,
+    claude_events_last: Option<u64>,
+    /// ZCode db 轮询与 hooks 事件轮询共同写入（任一来源来数即更新）
+    zcode_last: Option<u64>,
+}
+
 pub fn agentboard_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -78,6 +101,7 @@ pub fn zcode_hook_append_event(line: &str, dir: &std::path::Path) -> std::io::Re
 
 pub struct AppState {
     pub machine: Arc<Mutex<Machine>>,
+    pub health: Arc<Mutex<SourceHealth>>,
 }
 
 #[tauri::command]
@@ -89,13 +113,26 @@ fn get_sessions(state: tauri::State<AppState>) -> Vec<SessionSnapshot> {
         .snapshots()
 }
 
+/// 每源 `{ connected, last_event_at }`：connected 沿用既有判定
+/// （转录目录存在 / Claude hooks 已注册 / ZCode db 存在 + hooks 已注册），
+/// last_event_at 来自采集线程的 SourceHealth（三态换算由前端按 health_state 规则做）。
 #[tauri::command]
-fn get_source_status() -> serde_json::Value {
+fn get_source_status(state: tauri::State<AppState>) -> serde_json::Value {
+    let h = state.health.lock().unwrap_or_else(|p| p.into_inner());
     serde_json::json!({
-        "claude_hooks": installer::ours_registered(&claude_settings_path()),
-        "claude_transcripts": claude_projects_dir().exists(),
-        "zcode_db": zcode_db_path().exists(),
-        "zcode_hooks": installer::ours_registered_zcode(&zcode_config_path()),
+        "claude_transcripts": {
+            "connected": claude_projects_dir().exists(),
+            "last_event_at": h.claude_transcripts_last,
+        },
+        "claude_events": {
+            "connected": installer::ours_registered(&claude_settings_path()),
+            "last_event_at": h.claude_events_last,
+        },
+        "zcode": {
+            "connected": zcode_db_path().exists()
+                && installer::ours_registered_zcode(&zcode_config_path()),
+            "last_event_at": h.zcode_last,
+        },
     })
 }
 
@@ -160,6 +197,41 @@ fn install_hooks_cmd() -> Result<serde_json::Value, String> {
     }))
 }
 
+// v0.1.3 交接项（Task 2 Concern #3）：ZCode hooks 安装/卸载的 Tauri 薄封装
+// （照 install_hooks_cmd 模式：hook exe 同目录 + zcode config 路径 + backups/state）。
+#[tauri::command]
+fn install_zcode_hooks_cmd() -> Result<serde_json::Value, String> {
+    let hook_exe = std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .parent()
+        .ok_or("无法定位安装目录")?
+        .join("agentboard-hook.exe");
+    if !hook_exe.exists() {
+        return Err("未找到 agentboard-hook.exe，请先完整构建".into());
+    }
+    let report = installer::install_zcode_hooks(
+        &hook_exe,
+        &zcode_config_path(),
+        &agentboard_dir().join("backups"),
+        &agentboard_dir().join("zcode-hooks-state.json"),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "backupPath": report.backup_path.to_string_lossy(),
+        "changed": report.changed,
+    }))
+}
+
+#[tauri::command]
+fn uninstall_zcode_hooks_cmd() -> Result<serde_json::Value, String> {
+    let removed = installer::uninstall_zcode_hooks(
+        &zcode_config_path(),
+        &agentboard_dir().join("zcode-hooks-state.json"),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({ "removed": removed }))
+}
+
 // ---------- 装配 ----------
 
 /// 采集线程 panic 不外扩散：整体 catch_unwind，只留一行日志。
@@ -182,14 +254,25 @@ fn send_all(tx: &mpsc::Sender<UnifiedEvent>, events: Vec<UnifiedEvent>) {
 
 /// ① 转录监听：启动时全量 poll 一次（发现既有会话），之后 notify-debouncer-full
 ///    递归 watch ~/.claude/projects，debounce 到手后再 poll；watch 建不起来则退化为 4s 轮询。
-fn spawn_transcript_watcher(tx: mpsc::Sender<UnifiedEvent>) {
+fn spawn_transcript_watcher(tx: mpsc::Sender<UnifiedEvent>, health: Arc<Mutex<SourceHealth>>) {
     spawn_guarded("claude-transcripts", move || {
         use notify_debouncer_full::{
             DebounceEventResult, new_debouncer, notify::RecursiveMode, notify::Watcher,
         };
         let root = claude_projects_dir();
         let mut poller = collectors::claude_transcripts::TranscriptPoller::new(root.clone());
-        send_all(&tx, poller.poll());
+        // 每次 poll 有新数据 → 更新来源健康时间戳（Task 4）
+        let mark = |n: usize| {
+            if n > 0 {
+                health
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .claude_transcripts_last = Some(now_ms());
+            }
+        };
+        let events = poller.poll();
+        mark(events.len());
+        send_all(&tx, events);
 
         let (sig_tx, sig_rx) = mpsc::channel::<()>();
         let debouncer = new_debouncer(
@@ -207,35 +290,46 @@ fn spawn_transcript_watcher(tx: mpsc::Sender<UnifiedEvent>) {
             if deb.watcher().watch(&root, RecursiveMode::Recursive).is_ok() {
                 // watch 建立成功：信号驱动
                 while sig_rx.recv().is_ok() {
-                    send_all(&tx, poller.poll());
+                    let events = poller.poll();
+                    mark(events.len());
+                    send_all(&tx, events);
                 }
                 return;
             }
         }
         // 兜底：debouncer/watch 失败 → 4s 轮询
         loop {
-            send_all(&tx, poller.poll());
+            let events = poller.poll();
+            mark(events.len());
+            send_all(&tx, events);
             std::thread::sleep(Duration::from_secs(4));
         }
     });
 }
 
 /// ② hook 事件：2s 间隔轮询 events 文件（文件不存在安全返回空）。
-fn spawn_hook_poller(tx: mpsc::Sender<UnifiedEvent>) {
+fn spawn_hook_poller(tx: mpsc::Sender<UnifiedEvent>, health: Arc<Mutex<SourceHealth>>) {
     spawn_guarded("claude-hooks", move || {
         let mut poller = collectors::claude_events::HookEventsPoller::new(
             agentboard_dir().join("events").join("claude-code.jsonl"),
             AgentKind::ClaudeCode,
         );
         loop {
-            send_all(&tx, poller.poll());
+            let events = poller.poll();
+            if !events.is_empty() {
+                health
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .claude_events_last = Some(now_ms());
+            }
+            send_all(&tx, events);
             std::thread::sleep(Duration::from_secs(2));
         }
     });
 }
 
 /// ③ ZCode：4s 间隔 poll；open 失败（源离线）退避 30s 重试。
-fn spawn_zcode_poller(tx: mpsc::Sender<UnifiedEvent>) {
+fn spawn_zcode_poller(tx: mpsc::Sender<UnifiedEvent>, health: Arc<Mutex<SourceHealth>>) {
     spawn_guarded("zcode", move || {
         let mut poller: Option<collectors::zcode_db::ZcodePoller> = None;
         loop {
@@ -250,7 +344,11 @@ fn spawn_zcode_poller(tx: mpsc::Sender<UnifiedEvent>) {
                 // 运行中判定窗口实时生效：每次 poll 前读一次 config（本地小 JSON，4s 一次可接受）
                 let cfg = core::config::load();
                 p.set_running_fresh_ms(cfg.running_fresh_ms);
-                send_all(&tx, p.poll(now_ms()));
+                let events = p.poll(now_ms());
+                if !events.is_empty() {
+                    health.lock().unwrap_or_else(|p| p.into_inner()).zcode_last = Some(now_ms());
+                }
+                send_all(&tx, events);
             }
             std::thread::sleep(Duration::from_secs(4));
         }
@@ -259,14 +357,18 @@ fn spawn_zcode_poller(tx: mpsc::Sender<UnifiedEvent>) {
 
 /// ⑤ ZCode hooks 事件（v0.1.3）：2s 间隔轮询 events/zcode.jsonl
 /// （agentboard-hook.exe zcode 桥写入；文件不存在安全返回空）。
-fn spawn_zcode_hook_poller(tx: mpsc::Sender<UnifiedEvent>) {
+fn spawn_zcode_hook_poller(tx: mpsc::Sender<UnifiedEvent>, health: Arc<Mutex<SourceHealth>>) {
     spawn_guarded("zcode-hooks", move || {
         let mut poller = collectors::claude_events::HookEventsPoller::new(
             agentboard_dir().join("events").join("zcode.jsonl"),
             AgentKind::ZCode,
         );
         loop {
-            send_all(&tx, poller.poll());
+            let events = poller.poll();
+            if !events.is_empty() {
+                health.lock().unwrap_or_else(|p| p.into_inner()).zcode_last = Some(now_ms());
+            }
+            send_all(&tx, events);
             std::thread::sleep(Duration::from_secs(2));
         }
     });
@@ -435,6 +537,7 @@ pub fn run() {
     // 启动时读一次 config 作初始阈值（load 失败退默认 15 分钟）；此后 core 循环每次
     // 注入 Tick 前重读 config 覆盖，设置页改动实时生效
     let machine = Arc::new(Mutex::new(Machine::new(core::config::load().done_after_ms)));
+    let health = Arc::new(Mutex::new(SourceHealth::default()));
     let history = Arc::new(Mutex::new(
         match History::open(&agentboard_dir().join("history.sqlite")) {
             Ok(h) => h,
@@ -455,6 +558,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             machine: machine.clone(),
+            health: health.clone(),
         })
         .setup(move |app| {
             // 通知横幅点击：toast 主体点击（tap）→ 唤起看板窗口。
@@ -506,10 +610,10 @@ pub fn run() {
             }
 
             // ①②③ + ④ + ⑤：采集线程 + 核心消费线程
-            spawn_transcript_watcher(tx.clone());
-            spawn_hook_poller(tx.clone());
-            spawn_zcode_poller(tx.clone());
-            spawn_zcode_hook_poller(tx.clone());
+            spawn_transcript_watcher(tx.clone(), health.clone());
+            spawn_hook_poller(tx.clone(), health.clone());
+            spawn_zcode_poller(tx.clone(), health.clone());
+            spawn_zcode_hook_poller(tx.clone(), health.clone());
             spawn_core(app.handle().clone(), rx, machine.clone(), history.clone());
             Ok(())
         })
@@ -519,7 +623,9 @@ pub fn run() {
             jump,
             get_config,
             set_config,
-            install_hooks_cmd
+            install_hooks_cmd,
+            install_zcode_hooks_cmd,
+            uninstall_zcode_hooks_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application")
@@ -756,5 +862,24 @@ mod tests {
             serde_json::from_str(r#"{"actionId":"dismiss"}"#).unwrap();
         assert!(!is_notification_tap(dismiss.action_id()));
         assert!(!is_notification_tap(""), "未知 action 不唤起");
+    }
+
+    // v0.1.3 Task 4：来源健康三态纯函数（None→未接入 / 10 分钟内→正常 / 超时→需要检查）
+    #[test]
+    fn health_state_three_states() {
+        let now = 10_000_000_000_000u64;
+        assert_eq!(health_state(None, now), "none", "从无数据 → 未接入");
+        assert_eq!(health_state(Some(now), now), "ok");
+        assert_eq!(
+            health_state(Some(now - 599_999), now),
+            "ok",
+            "阈值内 → 正常"
+        );
+        assert_eq!(
+            health_state(Some(now - 600_000), now),
+            "stale",
+            "恰好 10 分钟 → 需要检查"
+        );
+        assert_eq!(health_state(Some(now - 3_600_000), now), "stale");
     }
 }

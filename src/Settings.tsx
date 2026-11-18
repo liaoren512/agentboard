@@ -8,23 +8,58 @@ interface Config {
   doneAfterMs: number;
 }
 
-// 与 lib.rs get_source_status 的 json! 键一致
+// 与 lib.rs get_source_status 的 json! 结构一致（每源 { connected, last_event_at }）
+interface SourceInfo {
+  connected: boolean;
+  last_event_at: number | null;
+}
 interface SourceStatus {
-  claude_hooks: boolean;
-  claude_transcripts: boolean;
-  zcode_db: boolean;
+  claude_transcripts: SourceInfo;
+  claude_events: SourceInfo;
+  zcode: SourceInfo;
 }
 
 const MS_PER_MIN = 60_000;
+const STALE_MS = 10 * 60 * 1000; // 与 lib.rs SOURCE_STALE_MS 一致
 
-function SourceDot({ ok, label }: { ok: boolean | undefined; label: string }) {
+// 与 lib.rs health_state 同规则：无数据→未接入 / 10 分钟内→正常 / 超时→需要检查
+type HealthState = "none" | "ok" | "stale";
+function healthState(last: number | null, now: number): HealthState {
+  if (last === null) return "none";
+  return now - last < STALE_MS ? "ok" : "stale";
+}
+
+function agoText(ts: number): string {
+  const diff = Math.max(0, Date.now() - ts);
+  if (diff < 60_000) return `${Math.floor(diff / 1000)} 秒前`;
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  return `${Math.floor(diff / 3_600_000)} 小时前`;
+}
+
+function healthText(state: HealthState, last: number | null): string {
+  if (state === "ok") return `正常 · 最后数据 ${agoText(last as number)}`;
+  if (state === "stale") return "需要检查 · 超过 10 分钟无数据";
+  return "未接入";
+}
+
+function SourceRow({
+  label,
+  info,
+  button,
+}: {
+  label: string;
+  info: SourceInfo | undefined;
+  button?: React.ReactNode;
+}) {
+  const state: HealthState = info ? healthState(info.last_event_at, Date.now()) : "none";
+  const cls = state === "ok" ? "dot-ok" : state === "stale" ? "dot-check" : "dot-off";
   return (
     <div className="src-row">
-      <span className={`dot ${ok ? "dot-ok" : "dot-off"}`} />
+      <span className={`dot ${cls}`} />
       <span>
-        {label}
-        {ok === undefined ? "…" : ok ? "" : "（未就绪）"}
+        {label} {info ? healthText(state, info.last_event_at) : "…"}
       </span>
+      {button}
     </div>
   );
 }
@@ -35,9 +70,15 @@ export default function Settings({ onBack }: { onBack: () => void }) {
   const [savedTip, setSavedTip] = useState(false);
   const [installMsg, setInstallMsg] = useState<string | null>(null);
   const [installErr, setInstallErr] = useState<string | null>(null);
+  const [zcMsg, setZcMsg] = useState<string | null>(null);
+  const [zcErr, setZcErr] = useState<string | null>(null);
+
+  const refresh = () => {
+    invoke<SourceStatus>("get_source_status").then(setStatus);
+  };
 
   useEffect(() => {
-    invoke<SourceStatus>("get_source_status").then(setStatus);
+    refresh();
     invoke<Config>("get_config").then(setCfg);
   }, []);
 
@@ -65,18 +106,45 @@ export default function Settings({ onBack }: { onBack: () => void }) {
       .catch((e) => setInstallErr(String(e)));
   };
 
+  const installZcodeHooks = () => {
+    setZcMsg(null);
+    setZcErr(null);
+    invoke<{ backupPath: string; changed: boolean }>("install_zcode_hooks_cmd")
+      .then((r) => {
+        setZcMsg(
+          r.changed
+            ? r.backupPath
+              ? `已写入 ZCode hooks，备份：${r.backupPath}`
+              : "已写入 ZCode hooks（新文件，无备份）"
+            : "ZCode hooks 已注册过，无需重复接入",
+        );
+        refresh();
+      })
+      .catch((e) => setZcErr(String(e)));
+  };
+
   return (
     <div className="settings">
       <button className="chip" onClick={onBack}>← 返回看板</button>
 
       <section>
         <h2>数据源</h2>
-        <SourceDot ok={status?.claude_hooks} label="Claude Code hook" />
-        <SourceDot ok={status?.claude_transcripts} label="Claude 转录目录" />
-        <SourceDot ok={status?.zcode_db} label="ZCode 数据库" />
+        <SourceRow label="Claude 转录" info={status?.claude_transcripts} />
+        <SourceRow label="Claude hooks 事件" info={status?.claude_events} />
+        <SourceRow
+          label="ZCode"
+          info={status?.zcode}
+          button={
+            <button className="btn-inline" onClick={installZcodeHooks}>
+              接入 ZCode hooks
+            </button>
+          }
+        />
         <button className="btn" onClick={installHooks}>接入 Claude Code</button>
         {installMsg && <div className="tip">{installMsg}</div>}
         {installErr && <div className="err">{installErr}</div>}
+        {zcMsg && <div className="tip">{zcMsg}</div>}
+        {zcErr && <div className="err">{zcErr}</div>}
       </section>
 
       {cfg && (

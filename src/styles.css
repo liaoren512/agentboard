@@ -216,6 +216,10 @@ h2 {
   background: #4caf7d;
 }
 
+.dot-check {
+  background: #e2b93b;
+}
+
 .dot-off {
   background: #4a4e55;
 }
@@ -233,6 +237,23 @@ h2 {
 
 .btn:hover {
   background: #4a7db5;
+}
+
+/* 来源行内小按钮（接入 ZCode hooks） */
+.btn-inline {
+  margin-left: auto;
+  border: 1px solid #3a6ea5;
+  background: transparent;
+  color: #7fb3ff;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.btn-inline:hover {
+  background: #3a6ea5;
+  color: #fff;
 }
 
 .setting-row {
