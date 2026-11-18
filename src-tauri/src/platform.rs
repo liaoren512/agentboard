@@ -72,6 +72,8 @@ mod tests {
             branch: None,
             status: SessionStatus::Done,
             done_inferred: false,
+            waiting_reason: None,
+            reply_head: None,
             last_activity: 0,
             time_created: 0,
         }

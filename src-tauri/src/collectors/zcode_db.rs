@@ -219,6 +219,7 @@ impl ZcodePoller {
                     agent,
                     session_id: id.clone(),
                     kind: WaitingKind::Idle,
+                    reason: None, // zcode 轮询源无摘要（v0.1.3 摘要仅来自 Claude PermissionRequest）
                     ts: live_ts,
                 }),
                 (ZStatus::Failed, Some(ZStatus::Failed)) => {}

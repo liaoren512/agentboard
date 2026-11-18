@@ -56,8 +56,32 @@ export default function SessionRow({ session }: { session: SessionSnapshot }) {
         <span className={`status-badge status-${statusClass(session.status)}`}>
           {STATUS_LABEL[session.status]}
         </span>
+        {session.status.startsWith("waiting") && session.waitingReason && (
+          <span className="waiting-reason" title={session.waitingReason}>
+            {session.waitingReason}
+          </span>
+        )}
         {session.status === "done" && session.doneInferred && (
           <span className="inferred-badge" title="由静默推断完成">推断</span>
+        )}
+        {session.status === "done" && session.replyHead && (
+          <span className="reply-head" title={session.replyHead}>
+            {session.replyHead}
+          </span>
+        )}
+        {(session.status.startsWith("waiting") || session.status === "failed") && (
+          <button
+            className="dismiss-btn"
+            title="消除这条"
+            onClick={(e) => {
+              e.stopPropagation(); // 不触发行跳转
+              invoke("dismiss_session", { sessionId: session.sessionId }).catch((err) =>
+                console.warn("dismiss_session failed:", err),
+              );
+            }}
+          >
+            ✕
+          </button>
         )}
       </div>
       {note && <div className="jump-note">{note}</div>}

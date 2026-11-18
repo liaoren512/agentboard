@@ -50,6 +50,49 @@ h2 {
   margin: 10px 0 4px;
 }
 
+/* 需处理标题行：标题 + 全部消除 */
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dismiss-all {
+  border: 1px solid #3a3d43;
+  background: transparent;
+  color: #9aa0a8;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.dismiss-all:hover {
+  border-color: #e5646f;
+  color: #e5646f;
+}
+
+/* 需处理行 hover 才出现的 ✕（消除单条） */
+.dismiss-btn {
+  flex: none;
+  display: none;
+  border: none;
+  background: transparent;
+  color: #9aa0a8;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.row:hover .dismiss-btn {
+  display: inline;
+}
+
+.dismiss-btn:hover {
+  color: #e5646f;
+}
+
 .row {
   display: flex;
   align-items: center;
@@ -138,6 +181,24 @@ h2 {
   color: #9aa0a8;
 }
 
+/* 行内"在等什么"（waiting 行，状态徽标旁）与完成摘要（done 行） */
+.waiting-reason,
+.reply-head {
+  flex: none;
+  max-width: 32%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #9aa0a8;
+  font-size: 11px;
+}
+
+.reply-head {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+}
+
 .jump-note {
   position: fixed;
   left: 50%;
@@ -198,6 +259,10 @@ h2 {
   background: #4caf7d;
 }
 
+.dot-check {
+  background: #e2b93b;
+}
+
 .dot-off {
   background: #4a4e55;
 }
@@ -215,6 +280,23 @@ h2 {
 
 .btn:hover {
   background: #4a7db5;
+}
+
+/* 来源行内小按钮（接入 ZCode hooks） */
+.btn-inline {
+  margin-left: auto;
+  border: 1px solid #3a6ea5;
+  background: transparent;
+  color: #7fb3ff;
+  border-radius: 4px;
+  padding: 1px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.btn-inline:hover {
+  background: #3a6ea5;
+  color: #fff;
 }
 
 .setting-row {

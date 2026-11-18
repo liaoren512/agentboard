@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { groupSessions } from "./board-model";
 import type { SessionSnapshot } from "./types";
 import SessionRow from "./SessionRow";
@@ -43,7 +44,19 @@ export default function Board({ sessions }: { sessions: SessionSnapshot[] }) {
 
       {groups.attention.length > 0 && (
         <section>
-          <h2>需处理</h2>
+          <div className="section-head">
+            <h2>需处理</h2>
+            <button
+              className="dismiss-all"
+              onClick={() =>
+                invoke("dismiss_all_attention").catch((e) =>
+                  console.warn("dismiss_all_attention failed:", e),
+                )
+              }
+            >
+              全部消除
+            </button>
+          </div>
           {groups.attention.map((s) => <SessionRow key={s.sessionId} session={s} />)}
         </section>
       )}

@@ -170,3 +170,8 @@ hook 的 stdin 输入含 `session_id`、`transcript_path`、`cwd`、`message` �
 ## v0.1.1 实现偏差注记
 
 1. **设置页两阈值曾未接线（本版修复）**：running_fresh_ms / done_after_ms 在 v0.1.0 仅存 config.json 不生效；v0.1.1 起 ZCode 运行中判定改用 time_updated 新鲜度（running_fresh_ms 每次 poll 前注入 ZcodePoller）、完成推断阈值 done_after_ms 每次注入 Tick 前注入 Machine，设置页保存后实时生效。判定精化（复审）：用 latest turn 的 completed_at 与 time_updated 先后（1s 容差）区分"刚结束"与"又开始了"——回合结束即最后事件时终态立即落定（error→Failed / completed→IdleWaiting，不被新鲜窗口延迟），结束后又有新活动且新鲜才判 Running
+
+## v0.1.3 实现偏差注记
+
+1. **Claude PermissionRequest/Stop hooks 与 ZCode hooks 桥已落地（早于原规划）**：Claude Code 权限请求与真实完成（Stop）事件经 hook 实时上报（权限请求附在等什么命令/文件，完成附回复摘要），ZCode 等待审批经设置页一键安装的 hooks 桥接入（装后新开任务生效）——原 §7"v0.1.1+"规划实现，本版完成；Claude 完成不再依赖静默推断，ZCode 等待不再因 db 无信号而不可见
+2. **阈值已接线**：running_fresh_ms / done_after_ms 自 v0.1.1 起接线生效（见上节），设置页保存后实时生效，无遗留偏差

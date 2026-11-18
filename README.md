@@ -5,6 +5,11 @@ Windows 托盘看板：实时聚合本机 Claude Code 与 ZCode 会话状态，�
 ## 功能
 
 - **看板四状态**：每个会话按 运行中 / 等待 / 失败 / 完成 分组展示，等待细分为权限、提问、空闲等
+- **Claude 权限即时可见**：Claude Code 权限请求经 hook 实时上报，看板即时显示在等什么命令/文件
+- **真实完成事件**：Claude Code 会话完成经 Stop hook 实时确认，附最后回复摘要
+- **ZCode hooks 接入**：设置页一键安装 ZCode hooks，任务等待审批即时可见（装后新开任务生效）
+- **需处理消除**：等待/失败条目可单条或全部标记已处理，从「需处理」清掉
+- **来源健康**：每个数据源三态（正常/离线/无数据）与最后数据时间一目了然
 - **托盘计数**：系统托盘菜单常驻显示「等待 N · 运行 N」，点击打开看板
 - **桌面通知**：会话转入等待 / 失败 / 完成时弹系统通知（可在设置页开关）
 - **历史**：本地留存最近 1000 条会话记录
@@ -26,13 +31,13 @@ npm run tauri build
 
 在应用设置页点击「接入 Claude Code」一键完成：
 
-- 修改 `~/.claude/settings.json`，添加一个 Notification hook，指向同目录的 `agentboard-hook.exe`
+- 修改 `~/.claude/settings.json`，添加 Notification / PermissionRequest / Stop 三个 hook，指向同目录的 `agentboard-hook.exe`
 - 写入前自动备份原 settings.json（备份存于 `~/.agentboard/backups/`）
 - 只添加/替换 agentboard 自己的 hook 条目，不碰其他配置；卸载应用后从备份还原或手动删除该条目即可
 
 ## ZCode 会话
 
-零配置：启动后只读本地 `~/.zcode/cli/db/db.sqlite`，不写入、不修改。
+默认零配置：启动后只读本地 `~/.zcode/cli/db/db.sqlite`，不写入、不修改。要在看板看到「等待审批」，需在设置页点击「接入 ZCode hooks」一键安装（装后新开任务生效）。
 
 ## 隐私
 
@@ -40,10 +45,10 @@ npm run tauri build
 
 ## 已知局限
 
-- ZCode 等待审批时数据库中无对应信号，看板暂不可见
-- 跳回通过新终端窗口打开工作目录，无法聚焦到原有的终端标签页
+- ZCode 等待审批需在设置页接入 hooks 后才可见（装后新开任务生效），仅靠 db 轮询推不出等待审批
+- 跳回为打开新终端窗口并复制工作目录/命令，无法聚焦到原有的终端标签页
 - 桌面通知受 Windows 专注模式（勿扰）设置影响
-- ZCode db 读不了时（被锁/schema 变化），会话列表静默冻结在最后状态，无 rollout 兜底也无「源离线」标注（计划 v0.1.1）
+- ZCode db 读不了时（被锁/schema 变化），该来源在设置页标记为离线，会话列表冻结在最后状态（无 rollout 兜底）
 - 历史 1000 条当前仅存档（写 history.sqlite），重启应用后不回填看板
 - 托盘计数显示在托盘菜单文本（「等待 N · 运行 N」），未做图标角标叠加
 - 无日志文件，排查问题需开发模式（`npm run tauri dev`）看终端输出

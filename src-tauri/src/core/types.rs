@@ -98,6 +98,10 @@ pub struct SessionSnapshot {
     pub branch: Option<String>,
     pub status: SessionStatus,
     pub done_inferred: bool,
+    /// "在等什么"摘要（PermissionRequest 的 tool_summary）；不等待时 None
+    pub waiting_reason: Option<String>,
+    /// 真实完成摘要（Stop 的 reply_head）；推断完成保持 None（推不出不硬标）
+    pub reply_head: Option<String>,
     pub last_activity: u64, // epoch ms
     pub time_created: u64,
 }
@@ -122,6 +126,9 @@ pub enum UnifiedEvent {
         agent: AgentKind,
         session_id: String,
         kind: WaitingKind,
+        /// 在等什么的摘要（Claude PermissionRequest 的 tool_summary）；其余来源 None
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
         ts: u64,
     },
     TurnFailed {
@@ -132,6 +139,9 @@ pub enum UnifiedEvent {
     TurnFinished {
         agent: AgentKind,
         session_id: String,
+        /// 完成摘要（Claude Stop 的 reply_head）；无摘要来源时 None
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_head: Option<String>,
         ts: u64,
     },
     Closed {
@@ -201,12 +211,91 @@ mod tests {
             agent: AgentKind::ClaudeCode,
             session_id: "abc".into(),
             kind: WaitingKind::Permission,
+            reason: None,
             ts: 1_732_000_000_000,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains(r#""type":"waiting""#));
         let back: UnifiedEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
+    }
+
+    // v0.1.3：Waiting.reason / TurnFinished.reply_head——Some 序列化、None 省略、旧 JSON 兼容
+    #[test]
+    fn waiting_reason_and_reply_head_serde() {
+        let w = UnifiedEvent::Waiting {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s".into(),
+            kind: WaitingKind::Permission,
+            reason: Some("git push".into()),
+            ts: 5,
+        };
+        let json = serde_json::to_string(&w).unwrap();
+        assert!(json.contains(r#""reason":"git push""#));
+        let back: UnifiedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(w, back);
+
+        // None → 字段省略，且旧 JSON（无 reason）可反序列化
+        let w2 = UnifiedEvent::Waiting {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s".into(),
+            kind: WaitingKind::Permission,
+            reason: None,
+            ts: 5,
+        };
+        let json2 = serde_json::to_string(&w2).unwrap();
+        assert!(!json2.contains("reason"));
+        let back2: UnifiedEvent = serde_json::from_str(&json2).unwrap();
+        assert_eq!(w2, back2);
+        let legacy = r#"{"type":"waiting","agent":"claude_code","session_id":"s","kind":"permission","ts":5}"#;
+        let back3: UnifiedEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back3, w2);
+
+        let t = UnifiedEvent::TurnFinished {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s".into(),
+            reply_head: Some("完成摘要".into()),
+            ts: 6,
+        };
+        let json4 = serde_json::to_string(&t).unwrap();
+        assert!(json4.contains(r#""reply_head":"完成摘要""#));
+        let back4: UnifiedEvent = serde_json::from_str(&json4).unwrap();
+        assert_eq!(t, back4);
+        let t2 = UnifiedEvent::TurnFinished {
+            agent: AgentKind::ClaudeCode,
+            session_id: "s".into(),
+            reply_head: None,
+            ts: 6,
+        };
+        let json5 = serde_json::to_string(&t2).unwrap();
+        assert!(!json5.contains("reply_head"));
+        let back5: UnifiedEvent = serde_json::from_str(&json5).unwrap();
+        assert_eq!(t2, back5);
+    }
+
+    // SessionSnapshot 新字段 camelCase：waitingReason / replyHead
+    #[test]
+    fn snapshot_serializes_camel_case_new_fields() {
+        let snap = SessionSnapshot {
+            session_id: "s".into(),
+            agent: AgentKind::ClaudeCode,
+            title: "t".into(),
+            cwd: r"C:\repo".into(),
+            repo: "repo".into(),
+            branch: None,
+            status: SessionStatus::Waiting(WaitingKind::Permission),
+            done_inferred: false,
+            waiting_reason: Some("git push".into()),
+            reply_head: None,
+            last_activity: 1,
+            time_created: 1,
+        };
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains(r#""waitingReason":"git push""#));
+        assert!(json.contains(r#""replyHead":null"#));
+        let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.waiting_reason.as_deref(), Some("git push"));
+        assert_eq!(back.reply_head, None);
     }
 
     #[test]

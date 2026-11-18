@@ -5,5 +5,6 @@ export type SessionStatus = "running" | `waiting_${WaitingKind}` | "failed" | "d
 export interface SessionSnapshot {
   sessionId: string; agent: AgentKind; title: string; cwd: string; repo: string;
   branch: string | null; status: SessionStatus; doneInferred: boolean;
+  waitingReason: string | null; replyHead: string | null;
   lastActivity: number; timeCreated: number;
 }
