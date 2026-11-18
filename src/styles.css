@@ -138,6 +138,24 @@ h2 {
   color: #9aa0a8;
 }
 
+/* 行内"在等什么"（waiting 行，状态徽标旁）与完成摘要（done 行） */
+.waiting-reason,
+.reply-head {
+  flex: none;
+  max-width: 32%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #9aa0a8;
+  font-size: 11px;
+}
+
+.reply-head {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+}
+
 .jump-note {
   position: fixed;
   left: 50%;

@@ -56,8 +56,18 @@ export default function SessionRow({ session }: { session: SessionSnapshot }) {
         <span className={`status-badge status-${statusClass(session.status)}`}>
           {STATUS_LABEL[session.status]}
         </span>
+        {session.status.startsWith("waiting") && session.waitingReason && (
+          <span className="waiting-reason" title={session.waitingReason}>
+            {session.waitingReason}
+          </span>
+        )}
         {session.status === "done" && session.doneInferred && (
           <span className="inferred-badge" title="由静默推断完成">推断</span>
+        )}
+        {session.status === "done" && session.replyHead && (
+          <span className="reply-head" title={session.replyHead}>
+            {session.replyHead}
+          </span>
         )}
       </div>
       {note && <div className="jump-note">{note}</div>}

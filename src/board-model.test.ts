@@ -5,6 +5,7 @@ import type { SessionSnapshot } from "./types";
 const mk = (over: Partial<SessionSnapshot>): SessionSnapshot => ({
   sessionId: "s", agent: "claude_code", title: "t", cwd: "C:\\r", repo: "r",
   branch: null, status: "running", doneInferred: false,
+  waitingReason: null, replyHead: null,
   lastActivity: 0, timeCreated: 0, ...over,
 });
 
