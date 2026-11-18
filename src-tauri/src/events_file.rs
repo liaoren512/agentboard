@@ -4,10 +4,16 @@ use std::path::Path;
 pub const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 
 pub fn append_event(line: &str, dir: &Path) -> std::io::Result<()> {
+    append_agent_event(line, dir, "claude-code.jsonl")
+}
+
+/// v0.1.3：按 agent 落盘（Claude → claude-code.jsonl，ZCode → zcode.jsonl）。
+/// 超阈值轮转（<file>.1），与 append_event 同一铁律。
+pub fn append_agent_event(line: &str, dir: &Path, file_name: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let file = dir.join("claude-code.jsonl");
+    let file = dir.join(file_name);
     if file.metadata().map(|m| m.len()).unwrap_or(0) > ROTATE_BYTES {
-        let _ = std::fs::rename(&file, dir.join("claude-code.jsonl.1"));
+        let _ = std::fs::rename(&file, dir.join(format!("{file_name}.1")));
     }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -41,7 +47,8 @@ fn cut(s: &str, n: usize) -> String {
 }
 
 /// pitwall line_head：首个非空行（trim 前后空白），截 n 字加 …；无非空行 → None。
-fn line_head(s: &str, n: usize) -> Option<String> {
+/// pub(crate)：zcode_hook 的 tool_summary 复用同一截断设计。
+pub(crate) fn line_head(s: &str, n: usize) -> Option<String> {
     s.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())

@@ -3,6 +3,7 @@ pub mod core;
 pub mod events_file;
 pub mod installer;
 pub mod platform;
+pub mod zcode_hook;
 
 use crate::core::history::History;
 use crate::core::machine::Machine;
@@ -54,6 +55,13 @@ pub fn zcode_db_path() -> PathBuf {
         .join("db")
         .join("db.sqlite")
 }
+pub fn zcode_config_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".zcode")
+        .join("cli")
+        .join("config.json")
+}
 pub fn events_file_now_ms() -> u64 {
     crate::core::types::now_ms()
 }
@@ -62,6 +70,10 @@ pub fn events_file_handle_input(input: &str, ts: u64) -> Option<String> {
 }
 pub fn events_file_append_event(line: &str, dir: &std::path::Path) -> std::io::Result<()> {
     events_file::append_event(line, dir)
+}
+/// ZCode hook 桥的事件落盘（events/zcode.jsonl）
+pub fn zcode_hook_append_event(line: &str, dir: &std::path::Path) -> std::io::Result<()> {
+    events_file::append_agent_event(line, dir, "zcode.jsonl")
 }
 
 pub struct AppState {
@@ -83,6 +95,7 @@ fn get_source_status() -> serde_json::Value {
         "claude_hooks": installer::ours_registered(&claude_settings_path()),
         "claude_transcripts": claude_projects_dir().exists(),
         "zcode_db": zcode_db_path().exists(),
+        "zcode_hooks": installer::ours_registered_zcode(&zcode_config_path()),
     })
 }
 
@@ -212,6 +225,7 @@ fn spawn_hook_poller(tx: mpsc::Sender<UnifiedEvent>) {
     spawn_guarded("claude-hooks", move || {
         let mut poller = collectors::claude_events::HookEventsPoller::new(
             agentboard_dir().join("events").join("claude-code.jsonl"),
+            AgentKind::ClaudeCode,
         );
         loop {
             send_all(&tx, poller.poll());
@@ -239,6 +253,21 @@ fn spawn_zcode_poller(tx: mpsc::Sender<UnifiedEvent>) {
                 send_all(&tx, p.poll(now_ms()));
             }
             std::thread::sleep(Duration::from_secs(4));
+        }
+    });
+}
+
+/// ⑤ ZCode hooks 事件（v0.1.3）：2s 间隔轮询 events/zcode.jsonl
+/// （agentboard-hook.exe zcode 桥写入；文件不存在安全返回空）。
+fn spawn_zcode_hook_poller(tx: mpsc::Sender<UnifiedEvent>) {
+    spawn_guarded("zcode-hooks", move || {
+        let mut poller = collectors::claude_events::HookEventsPoller::new(
+            agentboard_dir().join("events").join("zcode.jsonl"),
+            AgentKind::ZCode,
+        );
+        loop {
+            send_all(&tx, poller.poll());
+            std::thread::sleep(Duration::from_secs(2));
         }
     });
 }
@@ -476,10 +505,11 @@ pub fn run() {
                 });
             }
 
-            // ①②③ + ④：三个采集线程 + 核心消费线程
+            // ①②③ + ④ + ⑤：采集线程 + 核心消费线程
             spawn_transcript_watcher(tx.clone());
             spawn_hook_poller(tx.clone());
             spawn_zcode_poller(tx.clone());
+            spawn_zcode_hook_poller(tx.clone());
             spawn_core(app.handle().clone(), rx, machine.clone(), history.clone());
             Ok(())
         })
