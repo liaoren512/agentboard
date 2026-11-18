@@ -50,6 +50,49 @@ h2 {
   margin: 10px 0 4px;
 }
 
+/* 需处理标题行：标题 + 全部消除 */
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dismiss-all {
+  border: 1px solid #3a3d43;
+  background: transparent;
+  color: #9aa0a8;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.dismiss-all:hover {
+  border-color: #e5646f;
+  color: #e5646f;
+}
+
+/* 需处理行 hover 才出现的 ✕（消除单条） */
+.dismiss-btn {
+  flex: none;
+  display: none;
+  border: none;
+  background: transparent;
+  color: #9aa0a8;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.row:hover .dismiss-btn {
+  display: inline;
+}
+
+.dismiss-btn:hover {
+  color: #e5646f;
+}
+
 .row {
   display: flex;
   align-items: center;

@@ -69,6 +69,20 @@ export default function SessionRow({ session }: { session: SessionSnapshot }) {
             {session.replyHead}
           </span>
         )}
+        {(session.status.startsWith("waiting") || session.status === "failed") && (
+          <button
+            className="dismiss-btn"
+            title="消除这条"
+            onClick={(e) => {
+              e.stopPropagation(); // 不触发行跳转
+              invoke("dismiss_session", { sessionId: session.sessionId }).catch((err) =>
+                console.warn("dismiss_session failed:", err),
+              );
+            }}
+          >
+            ✕
+          </button>
+        )}
       </div>
       {note && <div className="jump-note">{note}</div>}
     </>

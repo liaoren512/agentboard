@@ -232,6 +232,27 @@ fn uninstall_zcode_hooks_cmd() -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "removed": removed }))
 }
 
+// v0.1.3 Task 5：需处理条目消除。处理后 emit sessions-changed 让看板即时刷新。
+#[tauri::command]
+fn dismiss_session(app: tauri::AppHandle, state: tauri::State<AppState>, session_id: String) {
+    let snaps = {
+        let mut m = state.machine.lock().unwrap_or_else(|p| p.into_inner());
+        m.dismiss(&session_id);
+        m.snapshots()
+    };
+    let _ = app.emit("sessions-changed", snaps);
+}
+
+#[tauri::command]
+fn dismiss_all_attention(app: tauri::AppHandle, state: tauri::State<AppState>) {
+    let snaps = {
+        let mut m = state.machine.lock().unwrap_or_else(|p| p.into_inner());
+        m.dismiss_all_attention();
+        m.snapshots()
+    };
+    let _ = app.emit("sessions-changed", snaps);
+}
+
 // ---------- 装配 ----------
 
 /// 采集线程 panic 不外扩散：整体 catch_unwind，只留一行日志。
@@ -625,7 +646,9 @@ pub fn run() {
             set_config,
             install_hooks_cmd,
             install_zcode_hooks_cmd,
-            uninstall_zcode_hooks_cmd
+            uninstall_zcode_hooks_cmd,
+            dismiss_session,
+            dismiss_all_attention
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application")
