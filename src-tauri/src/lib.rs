@@ -8,7 +8,7 @@ pub mod zcode_hook;
 use crate::core::history::History;
 use crate::core::machine::Machine;
 use crate::core::types::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -173,6 +173,46 @@ fn get_config() -> core::config::Config {
 #[tauri::command]
 fn set_config(cfg: core::config::Config) -> Result<(), String> {
     core::config::save(&cfg).map_err(|e| e.to_string())
+}
+
+/// v0.1.4 启动自愈：v0.1.3 之前的历史版本给 PermissionRequest/Stop 组写过无 args 的
+/// shell-form 坏组，组级幂等按标记识别不会自动修复。启动时检测：settings.json 存在且
+/// 含我们的标记组（任意事件）→ 静默 install_hooks 一次（有效组幂等跳过，坏组/缺组
+/// 替换重建；备份/幂等复用 installer）。从未接入（无标记）→ 不动（尊重用户选择）。
+/// hook exe 不在主程序同目录（存在才做）或任何失败 → 静默（一行 eprintln，不弹窗）。
+fn install_hooks_auto() {
+    let hook_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("agentboard-hook.exe")))
+        .filter(|p| p.exists());
+    let Some(hook_exe) = hook_exe else {
+        return;
+    };
+    install_hooks_auto_at(
+        &hook_exe,
+        &claude_settings_path(),
+        &agentboard_dir().join("backups"),
+    );
+}
+
+/// install_hooks_auto 的可注入形态（测试用临时目录；hook exe 存在性由调用方保证）。
+fn install_hooks_auto_at(hook_exe: &Path, settings_path: &Path, backup_root: &Path) {
+    // 从未接入（settings 缺失/不可读/无标记组）→ 原样返回，不自动安装
+    let has_marker = std::fs::read_to_string(settings_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|root| installer::has_marker_group(&root))
+        .unwrap_or(false);
+    if !has_marker {
+        return;
+    }
+    match installer::install_hooks(hook_exe, settings_path, backup_root) {
+        Ok(r) if r.changed => {
+            eprintln!("[agentboard] 启动自愈：检测到损坏/缺失的 hook 组，已重建")
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[agentboard] 启动自愈失败（不影响启动）：{e}"),
+    }
 }
 
 #[tauri::command]
@@ -630,6 +670,10 @@ pub fn run() {
                 });
             }
 
+            // v0.1.4 启动自愈：历史版本写下的坏 hook 组在采集线程启动前静默重建
+            //（从未接入的用户不动；失败只留一行日志）
+            install_hooks_auto();
+
             // ①②③ + ④ + ⑤：采集线程 + 核心消费线程
             spawn_transcript_watcher(tx.clone(), health.clone());
             spawn_hook_poller(tx.clone(), health.clone());
@@ -904,5 +948,58 @@ mod tests {
             "恰好 10 分钟 → 需要检查"
         );
         assert_eq!(health_state(Some(now - 3_600_000), now), "stale");
+    }
+
+    // ---------- v0.1.4 启动自愈（临时目录注入，不碰真实 ~/.claude） ----------
+
+    fn auto_base(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ab-lib-auto-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("agentboard-hook.exe");
+        std::fs::write(&exe, b"fake").unwrap();
+        (exe, dir.join("settings.json"), dir.join("backups"), dir)
+    }
+
+    /// 启动自愈：settings 含我们的标记组（历史坏组：无 args）→ 自动重建为带正确
+    /// args 的完整三组。
+    #[test]
+    fn install_hooks_auto_heals_bad_marker_group() {
+        let (exe, settings, backup, dir) = auto_base("heal");
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"C:\\old\\agentboard-hook.exe"}]}]}}"#,
+        )
+        .unwrap();
+        install_hooks_auto_at(&exe, &settings, &backup);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let stop = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "坏组替换不追加");
+        assert_eq!(
+            stop[0]["hooks"][0]["args"],
+            serde_json::json!(["stop"]),
+            "坏组重建为 exec form"
+        );
+        assert_eq!(v["hooks"]["Notification"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hooks"]["PermissionRequest"].as_array().unwrap().len(), 1);
+        assert!(backup.exists(), "修复前已备份");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动自愈：settings 无我们的标记（从未接入）→ 原样不动（尊重用户选择）。
+    #[test]
+    fn install_hooks_auto_skips_without_marker() {
+        let (exe, settings, backup, dir) = auto_base("skip");
+        let before =
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"other.exe"}]}]}}"#;
+        std::fs::write(&settings, before).unwrap();
+        install_hooks_auto_at(&exe, &settings, &backup);
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            before,
+            "无标记 → 一字不动"
+        );
+        assert!(!backup.exists(), "不动 → 不产生备份");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

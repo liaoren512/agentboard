@@ -20,6 +20,16 @@ const HOOK_EVENTS: [&str; 3] = ["Notification", "PermissionRequest", "Stop"];
 /// 三组 hooks 必须全部 exec form（带 args）：Claude Code 对带 args 的 hook 直接
 /// spawn exe（argv 传参，路径反斜杠/空格安全）；不带 args 则按 shell 命令执行，
 /// Windows 上经 Git Bash `sh -c` 会吃掉反斜杠、拆散空格，exe 路径失效。
+/// 各事件 hook 的子命令参数（Notification → "notification" 等）。our_groups 构造与
+/// group_valid 校验共用同一来源，避免两处形状漂移。
+fn hook_args(event: &str) -> &'static str {
+    match event {
+        "Notification" => "notification",
+        "PermissionRequest" => "permission_request",
+        _ => "stop",
+    }
+}
+
 fn our_groups(cmd: &str) -> Vec<serde_json::Value> {
     HOOK_EVENTS
         .iter()
@@ -27,11 +37,7 @@ fn our_groups(cmd: &str) -> Vec<serde_json::Value> {
             let hook = serde_json::json!({
                 "type": "command",
                 "command": cmd,
-                "args": [match *event {
-                    "Notification" => "notification",
-                    "PermissionRequest" => "permission_request",
-                    _ => "stop",
-                }]
+                "args": [hook_args(event)]
             });
             let mut group = serde_json::json!({ "hooks": [hook] });
             if *event == "Notification" {
@@ -60,8 +66,9 @@ pub fn install_hooks(
             "settings.json 顶层不是 JSON 对象",
         ));
     }
-    // 组级幂等：每组按"对应事件键 + command 含标记"逐个判，三组全在才无变更
-    //（v0.1.0 旧单组文件缺 PermissionRequest/Stop → 照常往下补装）
+    // 组级幂等：每组按"对应事件键 + command 含标记 + args 与期望一致"逐个判，三组全
+    // 有效才无变更（v0.1.0 旧单组文件缺 PermissionRequest/Stop → 照常往下补装；
+    // v0.1.3 之前写下的无 args 坏组 → 视为缺失，替换重建）
     if HOOK_EVENTS.iter().all(|event| group_present(&root, event)) {
         return Ok(InstallReport {
             backup_path: PathBuf::new(),
@@ -93,10 +100,12 @@ pub fn install_hooks(
             "settings.json 的 hooks 字段不是 JSON 对象",
         ));
     };
-    // 组级补装：缺哪组 push 哪组，已有组（含旧版本 Notification 组）原样保留不重建
+    // 组级补装：缺哪组/哪组是坏组（含标记但 args 不符）就重建哪组，有效组
+    // （含旧版本 Notification 组）原样保留不重建
     let mut added = false;
     for (event, group) in HOOK_EVENTS.iter().cloned().zip(our_groups(&exe_str)) {
-        added |= ensure_group(hooks_obj, event, group)?;
+        let valid = |g: &Value| group_valid(g, event);
+        added |= ensure_group(hooks_obj, event, group, &valid)?;
     }
     if !added {
         // 前置检查已挡全存在的情况，此处防御：类型异常等导致的零改动按无变更返回
@@ -118,12 +127,15 @@ pub fn install_hooks(
     })
 }
 
-/// 向某事件数组 ensure 一组我们的 hook：已存在（按标记识别）→ 不动；缺 → push。
-/// 事件已有值但不是数组 → InvalidData。
+/// 向某事件数组 ensure 一组我们的 hook：有效组已存在（valid 判定）→ 不动；含标记的
+/// 坏组（v0.1.3 之前历史版本写下的无 args shell-form 组等）先移除再 push 新组替换，
+/// 防重复追加。事件已有值但不是数组 → InvalidData。valid 判定"这组已是目标形状"
+/// （Claude 按 args 精确比对；ZCode 只按标记）。
 fn ensure_group(
     hooks_obj: &mut serde_json::Map<String, Value>,
     event: &str,
     group: Value,
+    valid: &dyn Fn(&Value) -> bool,
 ) -> std::io::Result<bool> {
     let arr = hooks_obj
         .entry(event.to_string())
@@ -134,9 +146,11 @@ fn ensure_group(
             format!("hooks.{event} 不是 JSON 数组"),
         ));
     };
-    if groups.iter().any(|g| is_ours(g)) {
+    if groups.iter().any(|g| valid(g)) {
         return Ok(false);
     }
+    // 走到这里说明没有有效组：含标记的坏组全部移除后 push 替换（第三方组不动）
+    groups.retain(|g| !is_ours(g));
     groups.push(group);
     Ok(true)
 }
@@ -165,25 +179,47 @@ pub fn ours_registered(settings_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-// exe 路径变化视为同一组件；更新路径时先 uninstall 再 install，故只按标记识别组
+/// 任意事件下是否存在含我们标记的组（不看 args 有效性）。v0.1.4 启动自愈用它判定
+/// "接入过"：无标记 = 从未接入，不自动安装（尊重用户选择）。
+pub fn has_marker_group(root: &Value) -> bool {
+    HOOK_EVENTS.iter().any(|event| {
+        root["hooks"][event]
+            .as_array()
+            .map(|groups| groups.iter().any(is_ours))
+            .unwrap_or(false)
+    })
+}
+
+// exe 路径变化视为同一组件；更新路径时先 uninstall 再 install。v0.1.4：判定还须
+// args 与期望一致——历史版本给 PermissionRequest/Stop 写过无 args 的 shell-form 组
+// （Git Bash 下报错），含标记但 args 缺失/不符 = 坏组 = 视为缺失，install 时替换重建
 fn group_present(root: &Value, event: &str) -> bool {
     root["hooks"][event]
         .as_array()
-        .map(|groups| groups.iter().any(|g| is_ours(g)))
+        .map(|groups| groups.iter().any(|g| group_valid(g, event)))
+        .unwrap_or(false)
+}
+
+/// 组有效性：组内含我们的标记，且该 hook 的 args 与事件期望值完全一致。
+fn group_valid(group: &Value, event: &str) -> bool {
+    let expected = serde_json::json!([hook_args(event)]);
+    group["hooks"]
+        .as_array()
+        .map(|hs| hs.iter().any(|h| is_ours_hook(h) && h["args"] == expected))
+        .unwrap_or(false)
+}
+
+fn is_ours_hook(hook: &Value) -> bool {
+    hook["command"]
+        .as_str()
+        .map(|c| c.replace('/', "\\").contains(MARKER))
         .unwrap_or(false)
 }
 
 fn is_ours(group: &Value) -> bool {
     group["hooks"]
         .as_array()
-        .map(|hs| {
-            hs.iter().any(|h| {
-                h["command"]
-                    .as_str()
-                    .map(|c| c.replace('/', "\\").contains(MARKER))
-                    .unwrap_or(false)
-            })
-        })
+        .map(|hs| hs.iter().any(is_ours_hook))
         .unwrap_or(false)
 }
 
@@ -329,7 +365,8 @@ pub fn install_zcode_hooks(
             let group = serde_json::json!({
                 "hooks": [{ "type": "process", "command": exe_str, "args": ["zcode", event], "timeoutMs": 65000 }]
             });
-            ensure_group(events_obj, event, group)?;
+            // ZCode 组无"坏组"概念：按标记识别即可（valid = is_ours）
+            ensure_group(events_obj, event, group, &is_ours)?;
         }
         hooks_obj.insert("enabled".into(), Value::Bool(true));
         Ok(())
@@ -616,6 +653,83 @@ mod tests {
             v["hooks"]["PreToolUse"][0]["matcher"], "Bash",
             "别人的 hook 不能动"
         );
+    }
+
+    // ---------- v0.1.4 组有效性升级：坏组识别与替换重建 ----------
+
+    /// ① 历史 shell-form 坏组（含标记但无 args）→ install 替换重建为带正确 args 的
+    /// exec form，组不重复。
+    #[test]
+    fn install_rebuilds_argsless_bad_group() {
+        let t = tmp("rebuild-noargs");
+        let (exe, settings) = exe_and_settings(&t.0);
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"PermissionRequest":[{"hooks":[{"type":"command","command":"C:\\old\\agentboard-hook.exe"}]}]}}"#,
+        )
+        .unwrap();
+        let report = install_hooks(&exe, &settings, &t.0.join("backups")).unwrap();
+        assert!(report.changed, "坏组视为缺失 → 重建");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let groups = v["hooks"]["PermissionRequest"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "替换而非追加：组不重复");
+        assert_eq!(
+            groups[0]["hooks"][0]["args"],
+            serde_json::json!(["permission_request"]),
+            "重建后带正确 args（exec form）"
+        );
+        assert!(
+            groups[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("agentboard-hook.exe")
+        );
+        // 缺的另两组照常补装
+        assert!(v["hooks"]["Notification"].as_array().unwrap().len() >= 1);
+        assert!(v["hooks"]["Stop"].as_array().unwrap().len() >= 1);
+    }
+
+    /// ② 含标记但 args 内容不符（args:["x"]）的组同样是坏组 → 替换重建。
+    #[test]
+    fn install_rebuilds_wrong_args_bad_group() {
+        let t = tmp("rebuild-wrongargs");
+        let (exe, settings) = exe_and_settings(&t.0);
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"C:\\x\\agentboard-hook.exe","args":["x"]}]}]}}"#,
+        )
+        .unwrap();
+        let report = install_hooks(&exe, &settings, &t.0.join("backups")).unwrap();
+        assert!(report.changed);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let groups = v["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "替换而非追加：组不重复");
+        assert_eq!(
+            groups[0]["hooks"][0]["args"],
+            serde_json::json!(["stop"]),
+            "args 不符的组重建为正确 args"
+        );
+    }
+
+    /// ③ 三组全为有效 exec form 组（旧 exe 路径）→ 幂等无变更，原文件一字不动。
+    #[test]
+    fn install_idempotent_with_valid_groups() {
+        let t = tmp("valid-idem");
+        let (exe, settings) = exe_and_settings(&t.0);
+        let content = r#"{"hooks":{
+            "Notification":[{"matcher":"permission_prompt|idle_prompt|agent_needs_input","hooks":[{"type":"command","command":"C:\\old\\agentboard-hook.exe","args":["notification"]}]}],
+            "PermissionRequest":[{"hooks":[{"type":"command","command":"C:\\old\\agentboard-hook.exe","args":["permission_request"]}]}],
+            "Stop":[{"hooks":[{"type":"command","command":"C:\\old\\agentboard-hook.exe","args":["stop"]}]}]
+        }}"#;
+        std::fs::write(&settings, content).unwrap();
+        let report = install_hooks(&exe, &settings, &t.0.join("backups")).unwrap();
+        assert!(!report.changed, "三组全有效 → 幂等无变更");
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            content,
+            "有效组不动：原文件逐字节保留"
+        );
+        assert!(!t.0.join("backups").exists(), "无变更不产生备份");
     }
 
     // v0.1.0 旧形态：settings 只有 Notification 一组含我们的 hook（旧 exe 路径），
