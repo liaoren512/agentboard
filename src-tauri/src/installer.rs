@@ -17,20 +17,27 @@ const HOOK_EVENTS: [&str; 3] = ["Notification", "PermissionRequest", "Stop"];
 
 /// 我们的三组定义（与 HOOK_EVENTS 一一对应），幂等检查与合并共用同一构造，
 /// 避免两处形状漂移。Notification 带 matcher；其余两组不带（见 HOOK_EVENTS 注）。
+/// 三组 hooks 必须全部 exec form（带 args）：Claude Code 对带 args 的 hook 直接
+/// spawn exe（argv 传参，路径反斜杠/空格安全）；不带 args 则按 shell 命令执行，
+/// Windows 上经 Git Bash `sh -c` 会吃掉反斜杠、拆散空格，exe 路径失效。
 fn our_groups(cmd: &str) -> Vec<serde_json::Value> {
     HOOK_EVENTS
         .iter()
         .map(|event| {
+            let hook = serde_json::json!({
+                "type": "command",
+                "command": cmd,
+                "args": [match *event {
+                    "Notification" => "notification",
+                    "PermissionRequest" => "permission_request",
+                    _ => "stop",
+                }]
+            });
+            let mut group = serde_json::json!({ "hooks": [hook] });
             if *event == "Notification" {
-                serde_json::json!({
-                    "matcher": MATCHER,
-                    "hooks": [{ "type": "command", "command": cmd, "args": ["notification"] }]
-                })
-            } else {
-                serde_json::json!({
-                    "hooks": [{ "type": "command", "command": cmd }]
-                })
+                group["matcher"] = serde_json::json!(MATCHER);
             }
+            group
         })
         .collect()
 }
@@ -546,6 +553,12 @@ mod tests {
                 .unwrap()
                 .ends_with("agentboard-hook.exe")
         );
+        // exec form：带 args 才直接 spawn exe；不带则走 shell（Windows 上路径被吃）
+        assert_eq!(
+            pr["hooks"][0]["args"],
+            serde_json::json!(["permission_request"]),
+            "PermissionRequest hooks[0].args 锁死 exec form"
+        );
         let stop = &v["hooks"]["Stop"][0];
         assert!(stop.get("matcher").is_none(), "Stop 组无 matcher 字段");
         assert!(
@@ -553,6 +566,11 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .ends_with("agentboard-hook.exe")
+        );
+        assert_eq!(
+            stop["hooks"][0]["args"],
+            serde_json::json!(["stop"]),
+            "Stop hooks[0].args 锁死 exec form"
         );
         // hook exe 被复制到备份根同级的 bin 目录约定位置由调用方定；此处只验证注册串里是传入的 exe 路径
     }
