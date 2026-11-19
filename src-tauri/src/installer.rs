@@ -15,6 +15,26 @@ pub struct InstallReport {
 /// Stop 完全不支持 matcher（写了也会被忽略）。
 const HOOK_EVENTS: [&str; 3] = ["Notification", "PermissionRequest", "Stop"];
 
+/// 我们的三组定义（与 HOOK_EVENTS 一一对应），幂等检查与合并共用同一构造，
+/// 避免两处形状漂移。Notification 带 matcher；其余两组不带（见 HOOK_EVENTS 注）。
+fn our_groups(cmd: &str) -> Vec<serde_json::Value> {
+    HOOK_EVENTS
+        .iter()
+        .map(|event| {
+            if *event == "Notification" {
+                serde_json::json!({
+                    "matcher": MATCHER,
+                    "hooks": [{ "type": "command", "command": cmd, "args": ["notification"] }]
+                })
+            } else {
+                serde_json::json!({
+                    "hooks": [{ "type": "command", "command": cmd }]
+                })
+            }
+        })
+        .collect()
+}
+
 pub fn install_hooks(
     hook_exe: &Path,
     settings_path: &Path,
@@ -33,6 +53,8 @@ pub fn install_hooks(
             "settings.json 顶层不是 JSON 对象",
         ));
     }
+    // 组级幂等：每组按"对应事件键 + command 含标记"逐个判，三组全在才无变更
+    //（v0.1.0 旧单组文件缺 PermissionRequest/Stop → 照常往下补装）
     if HOOK_EVENTS.iter().all(|event| group_present(&root, event)) {
         return Ok(InstallReport {
             backup_path: PathBuf::new(),
@@ -64,19 +86,9 @@ pub fn install_hooks(
             "settings.json 的 hooks 字段不是 JSON 对象",
         ));
     };
-    // 逐事件 ensure（旧版本单组文件 → 只补缺的组，不重复）
+    // 组级补装：缺哪组 push 哪组，已有组（含旧版本 Notification 组）原样保留不重建
     let mut added = false;
-    for event in HOOK_EVENTS {
-        let group = if event == "Notification" {
-            serde_json::json!({
-                "matcher": MATCHER,
-                "hooks": [{ "type": "command", "command": exe_str, "args": ["notification"] }]
-            })
-        } else {
-            serde_json::json!({
-                "hooks": [{ "type": "command", "command": exe_str }]
-            })
-        };
+    for (event, group) in HOOK_EVENTS.iter().cloned().zip(our_groups(&exe_str)) {
         added |= ensure_group(hooks_obj, event, group)?;
     }
     if !added {
@@ -588,29 +600,42 @@ mod tests {
         );
     }
 
-    // 旧版本（v0.1.2 及以前）settings 只有 Notification 单组：升级补装 PermissionRequest/Stop，
-    // Notification 不重复。
+    // v0.1.0 旧形态：settings 只有 Notification 一组含我们的 hook（旧 exe 路径），
+    // 同数组还有第三方组：升级 → 只补装缺的 PermissionRequest/Stop 两组，
+    // 原 Notification 组（含旧路径）与第三方组原样保留，changed=true。
     #[test]
     fn upgrades_legacy_single_group_file() {
         let t = tmp("upgrade");
         let (exe, settings) = exe_and_settings(&t.0);
         std::fs::write(
             &settings,
-            r#"{"hooks":{"Notification":[{"matcher":"permission_prompt|idle_prompt|agent_needs_input","hooks":[{"type":"command","command":"C:\\old\\agentboard-hook.exe","args":["notification"]}]}]}}"#,
+            r#"{"hooks":{"Notification":[{"matcher":"permission_prompt|idle_prompt|agent_needs_input","hooks":[{"type":"command","command":"C:\\old\\agentboard-hook.exe","args":["notification"]}]},{"matcher":"other","hooks":[{"type":"command","command":"third.exe"}]}]}}"#,
         )
         .unwrap();
         let report = install_hooks(&exe, &settings, &t.0.join("backups")).unwrap();
         assert!(report.changed);
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let notif = v["hooks"]["Notification"].as_array().unwrap();
+        assert_eq!(notif.len(), 2, "Notification 只保留原有两组，不重复补装");
+        // 原我们的组原样保留（旧 exe 路径不被重建为当前路径）
         assert_eq!(
-            v["hooks"]["Notification"].as_array().unwrap().len(),
-            1,
-            "既有 Notification 组不重复补装"
+            notif[0]["hooks"][0]["command"], "C:\\old\\agentboard-hook.exe",
+            "既有 Notification 组原样保留，不重建"
         );
+        assert_eq!(notif[0]["hooks"][0]["args"][0], "notification");
+        // 同数组第三方组不动
+        assert_eq!(notif[1]["hooks"][0]["command"], "third.exe");
+        // 缺的两组已补装（用当前传入的 exe 路径）
         assert_eq!(v["hooks"]["PermissionRequest"].as_array().unwrap().len(), 1);
         assert_eq!(v["hooks"]["Stop"].as_array().unwrap().len(), 1);
-        // 再装一次收敛为幂等
+        assert!(
+            v["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("agentboard-hook.exe")
+        );
+        // 再装一次收敛为幂等（三组全齐 → changed=false）
         let report = install_hooks(&exe, &settings, &t.0.join("backups")).unwrap();
         assert!(!report.changed);
     }
